@@ -71,6 +71,26 @@ class TestRemove:
         assert count == 1
         assert store.count() == 1
 
+    def test_remove_by_content_underscore_is_literal(self, store):
+        """Regression: _ in LIKE is a wildcard — must be escaped."""
+        store.add("memory", "test_data one")
+        store.add("memory", "testXdata two")
+        count = store.remove_by_content("test_data")
+        assert count == 1  # only "test_data one", not "testXdata two"
+        remaining = store.get_all()
+        assert len(remaining) == 1
+        assert remaining[0]["content"] == "testXdata two"
+
+    def test_remove_by_content_percent_is_literal(self, store):
+        """Regression: % in LIKE is a wildcard — must be escaped."""
+        store.add("memory", "Disk at 100% full")
+        store.add("memory", "Disk at 200% full")
+        count = store.remove_by_content("100%")
+        assert count == 1
+        remaining = store.get_all()
+        assert len(remaining) == 1
+        assert remaining[0]["content"] == "Disk at 200% full"
+
 
 class TestSearch:
     def test_search_finds_matching(self, store):

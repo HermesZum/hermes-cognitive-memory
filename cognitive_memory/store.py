@@ -219,12 +219,19 @@ class MemoryStore:
             return cur.rowcount > 0
 
     def remove_by_content(self, content_substring: str) -> int:
-        """Remove memories whose content contains the substring. Returns count."""
+        """Remove memories whose content contains the substring. Returns count.
+
+        Escapes LIKE wildcards (% and _) in the substring so they match
+        literally, not as pattern characters.
+        """
+        # Escape LIKE special characters so they match literally
+        # ESCAPE clause uses backslash as the escape character
+        escaped = content_substring.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
             assert self._conn is not None
             cur = self._conn.execute(
-                "DELETE FROM memories WHERE content LIKE ?",
-                (f"%{content_substring}%",),
+                "DELETE FROM memories WHERE content LIKE ? ESCAPE '\\'",
+                (f"%{escaped}%",),
             )
             self._conn.commit()
             return cur.rowcount
