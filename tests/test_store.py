@@ -13,7 +13,7 @@ from cognitive_memory.store import MemoryStore
 def store(tmp_path):
     """Create a temporary MemoryStore for each test."""
     db_path = tmp_path / "test_memory.db"
-    params = DecayParams(decay_rate=0.15, decay_floor=0.05, access_boost=0.3)
+    params = DecayParams(decay_rate=0.02, decay_floor=0.05, access_boost=0.3)
     s = MemoryStore(db_path, params)
     s.connect()
     yield s
@@ -131,19 +131,56 @@ class TestSearch:
 
 
 class TestDecayApplication:
-    def test_global_decay_reduces_importance(self, store):
-        mem_id = store.add("memory", "will decay", origin="user_preference")
-        # Simulate time passing by manually setting last_access to the past
+    def test_global_decay_reports_prunable(self, store):
+        """apply_global_decay now reports prunable count without modifying stored importance."""
+        mem_id = store.add("memory", "will decay", origin="agent_inference")
+        # Simulate time passing — 15 days is enough for agent_inference (0.35, floor 0.05)
         store._conn.execute(
             "UPDATE memories SET last_access = ? WHERE id = ?",
-            (time.time() - 86400, mem_id),  # 1 day ago
+            (time.time() - 86400 * 15, mem_id),  # 15 days ago
         )
         store._conn.commit()
 
+        # Stored importance should NOT change (decay is computed on the fly)
         before = store.get(mem_id)["importance"]
-        store.apply_global_decay()
+        prunable = store.apply_global_decay()
         after = store.get(mem_id)["importance"]
-        assert after < before
+
+        assert after == before  # stored importance unchanged
+        assert prunable == 1    # but it IS prunable (decayed to ~0.043, below 0.05)
+
+    def test_decay_computed_on_the_fly(self, store):
+        """Search ranking uses decayed importance computed at retrieval time."""
+        mem_id = store.add("memory", "old memory", origin="user_preference")
+        # Set last_access to 5 days ago
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id = ?",
+            (time.time() - 86400 * 5, mem_id),
+        )
+        store._conn.commit()
+
+        stored_importance = store.get(mem_id)["importance"]
+        # Compute what decayed importance should be
+        from cognitive_memory.decay import apply_decay
+        import time as _time
+        decayed = apply_decay(stored_importance, _time.time() - 86400 * 5, _time.time(), store._params)
+
+        assert decayed < stored_importance  # decayed is lower
+        assert decayed > 0.0                 # but not zero
+
+    def test_prune_removes_decayed_memory(self, store):
+        """Prune deletes memories whose computed decayed importance is below floor."""
+        mem_id = store.add("memory", "will be pruned", origin="agent_inference")
+        # Set last_access far in the past so decayed importance < floor
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id = ?",
+            (time.time() - 86400 * 30, mem_id),  # 30 days ago
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        assert pruned == 1
+        assert store.count() == 0
 
     def test_prune_removes_low_importance(self, store):
         mem_id = store.add("memory", "will be pruned", origin="agent_inference")
@@ -169,6 +206,61 @@ class TestDecayApplication:
         pruned = store.prune()
         assert pruned == 0
         assert store.count() == 1
+
+
+    def test_prune_protects_user_corrections(self, store):
+        """User corrections survive longer than agent inferences.
+
+        With decay_rate=0.02:
+          - user_correction (0.95, floor 0.02): 0.95/(1+0.02*h) < 0.02 → h > 2325h = 97 days
+          - agent_inference (0.35, floor 0.05): 0.35/(1+0.02*h) < 0.05 → h > 300h = 12.5 days
+
+        At 15 days: correction survives, inference is pruned.
+        """
+        correction_id = store.add("memory", "important correction", origin="user_correction")
+        inference_id = store.add("memory", "low value inference", origin="agent_inference")
+
+        import time
+        fifteen_days_ago = time.time() - 86400 * 15
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id IN (?, ?)",
+            (fifteen_days_ago, correction_id, inference_id),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        # agent_inference pruned (decayed below 0.05)
+        # user_correction survives (decayed to ~0.24, well above 0.02)
+        assert pruned == 1
+        assert store.get(correction_id) is not None
+        assert store.get(inference_id) is None
+
+    def test_prune_protects_user_preferences(self, store):
+        """User preferences survive longer than environment facts.
+
+        With decay_rate=0.02:
+          - user_preference (0.85, floor 0.03): 0.85/(1+0.02*h) < 0.03 → h > 1367h = 57 days
+          - environment_fact (0.60, floor 0.05): 0.60/(1+0.02*h) < 0.05 → h > 550h = 23 days
+
+        At 25 days: preference survives, environment_fact is pruned.
+        """
+        pref_id = store.add("memory", "my preference", origin="user_preference")
+        fact_id = store.add("memory", "environment detail", origin="environment_fact")
+
+        import time
+        twenty_five_days_ago = time.time() - 86400 * 25
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id IN (?, ?)",
+            (twenty_five_days_ago, pref_id, fact_id),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        # environment_fact pruned (decayed below 0.05)
+        # user_preference survives (decayed to ~0.15, well above 0.03)
+        assert pruned == 1
+        assert store.get(pref_id) is not None
+        assert store.get(fact_id) is None
 
 
 class TestRetrievalEffects:

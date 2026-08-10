@@ -27,8 +27,11 @@ class DecayParams:
 
     # 1. Ebbinghaus decay
     #   importance *= 1 / (1 + decay_rate * hours_elapsed)
-    #   Higher = faster forgetting. 0.15 means ~15% per hour at baseline.
-    decay_rate: float = 0.15
+    #   Higher = faster forgetting. 0.02 means ~2% per hour at baseline.
+    #   With rate=0.02: user corrections survive ~11 days without access,
+    #   agent inferences survive ~12.5 days. Accessed memories survive
+    #   indefinitely (reinforcement boosts offset decay).
+    decay_rate: float = 0.02
 
     # 5. Access reinforcement
     #   importance += access_boost on each retrieval
@@ -46,7 +49,8 @@ class DecayParams:
     # 4. Source-confidence decay
     #   confidence *= 1 / (1 + confidence_decay_rate * hours_elapsed)
     #   Slower than importance decay — trust erodes gradually.
-    confidence_decay_rate: float = 0.02
+    #   Default is 10x slower than importance decay.
+    confidence_decay_rate: float = 0.002
 
     # 8. Decay floor — memories below this are prunable
     decay_floor: float = 0.05
@@ -116,7 +120,7 @@ def apply_decay(
 
 def apply_confidence_decay(
     confidence: float,
-    created_at: float,
+    last_access: float,
     now: float,
     params: DecayParams,
 ) -> float:
@@ -126,12 +130,15 @@ def apply_confidence_decay(
     than importance. A memory you heard from a reliable source a week ago
     is still somewhat trustworthy, just less than a fresh one.
 
+    Computed on the fly at retrieval time from last_access (not stored),
+    so there is no compounding.
+
     Formula:
-        elapsed_hours = (now - created_at) / 3600
+        elapsed_hours = (now - last_access) / 3600
         stability = 1 / (1 + confidence_decay_rate * elapsed_hours)
         new_confidence = confidence * stability
     """
-    elapsed_hours = max(0.0, (now - created_at) / 3600.0)
+    elapsed_hours = max(0.0, (now - last_access) / 3600.0)
     stability = 1.0 / (1.0 + params.confidence_decay_rate * elapsed_hours)
     return max(0.0, min(1.0, confidence * stability))
 

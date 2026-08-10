@@ -326,6 +326,10 @@ class MemoryStore:
                 return self._like_search(query, target, max_limit, now)
 
             # Re-rank with cognitive scores — ALL under the lock
+            # Compute decayed importance ON THE FLY from stored importance +
+            # last_access. This is the ONLY place decay is applied — we never
+            # store decayed values, avoiding compounding and double-decay.
+            now = time.time()
             scored = []
             for row in rows:
                 fts_score = row.pop("fts_score", 0.0)
@@ -333,11 +337,13 @@ class MemoryStore:
                 # We negate and normalize: a perfect match is typically around -2 to -5
                 normalized_fts = max(0.0, min(1.0, (-fts_score) / 3.0)) if fts_score != 0 else 0.5
 
+                # Compute decayed importance on the fly (not stored)
                 decayed_importance = apply_decay(
                     row["importance"], row["last_access"], now, self._params
                 )
+                # Confidence also computed on the fly
                 decayed_confidence = apply_confidence_decay(
-                    row["confidence"], row["created_at"], now, self._params
+                    row["confidence"], row["last_access"], now, self._params
                 )
 
                 score = normalized_fts * decayed_importance * decayed_confidence
@@ -380,13 +386,13 @@ class MemoryStore:
 
         scored = []
         for row in rows:
+            # Compute decayed importance on the fly (not stored)
             decayed_importance = apply_decay(
                 row["importance"], row["last_access"], now, self._params
             )
             decayed_confidence = apply_confidence_decay(
-                row["confidence"], row["created_at"], now, self._params
+                row["confidence"], row["last_access"], now, self._params
             )
-            # Without FTS, use importance × confidence as the ranking
             score = decayed_importance * decayed_confidence
             scored.append((row, score))
 
@@ -428,11 +434,12 @@ class MemoryStore:
 
             scored = []
             for row in rows:
+                # Compute decayed importance on the fly (not stored)
                 decayed_importance = apply_decay(
                     row["importance"], row["last_access"], now, self._params
                 )
                 decayed_confidence = apply_confidence_decay(
-                    row["confidence"], row["created_at"], now, self._params
+                    row["confidence"], row["last_access"], now, self._params
                 )
                 score = decayed_importance * decayed_confidence
                 scored.append((row, score))
@@ -488,9 +495,17 @@ class MemoryStore:
     # -- Maintenance --------------------------------------------------------
 
     def apply_global_decay(self) -> int:
-        """Apply time-based decay to ALL memories. Returns count of prunable memories.
+        """Check which memories would be prunable based on current decay.
 
-        Called once per turn (sync_turn) to keep importance scores current.
+        Returns count of prunable memories. Does NOT modify stored importance —
+        decay is computed on the fly at retrieval/pruning time, never stored.
+
+        This avoids two bugs:
+        1. Compounding: applying decay repeatedly to already-decayed values
+        2. Double-decay: search() applying decay again on stored decayed values
+
+        Stored importance only changes via retrieval effects (access boost,
+        reconsolidation) — never via time-based decay.
         """
         now = time.time()
         prunable = 0
@@ -500,41 +515,73 @@ class MemoryStore:
                 return 0
 
             cur = self._conn.execute(
-                "SELECT id, importance, last_access, created_at, confidence FROM memories"
+                "SELECT id, importance, last_access, origin FROM memories"
             )
             rows = cur.fetchall()
 
             for row in rows:
-                decayed_importance = apply_decay(
+                decayed = apply_decay(
                     row["importance"], row["last_access"], now, self._params
                 )
-                decayed_confidence = apply_confidence_decay(
-                    row["confidence"], row["created_at"], now, self._params
-                )
-
-                self._conn.execute(
-                    "UPDATE memories SET importance = ?, confidence = ? WHERE id = ?",
-                    (decayed_importance, decayed_confidence, row["id"]),
-                )
-
-                if should_prune(decayed_importance, self._params):
+                effective_floor = self._effective_floor(row["origin"])
+                if decayed < effective_floor:
                     prunable += 1
-
-            self._conn.commit()
 
         return prunable
 
+    def _effective_floor(self, origin: str) -> float:
+        """Get the effective decay floor for a memory based on its origin.
+
+        Important memories (user corrections, preferences) get a LOWER floor,
+        meaning they can decay further before being pruned. This protects
+        them — a user_correction starting at 0.95 with floor 0.02 survives
+        much longer than an agent_inference at 0.35 with floor 0.05.
+
+        - user_correction: 0.02 (survives ~45+ days without access)
+        - user_preference: 0.03 (survives ~35+ days without access)
+        - environment_fact: 0.05 (default floor, ~23 days)
+        - agent_inference: 0.05 (default floor, ~12.5 days)
+        """
+        if origin == "user_correction":
+            return min(0.02, self._params.decay_floor)
+        if origin == "user_preference":
+            return min(0.03, self._params.decay_floor)
+        return self._params.decay_floor
+
     def prune(self) -> int:
-        """Delete all memories below the decay floor. Returns count deleted."""
+        """Delete all memories below their origin-specific decay floor.
+
+        Computes decayed importance on the fly — does not rely on stored
+        importance being pre-decayed.
+        """
+        now = time.time()
         with self._lock:
             if not self._conn:
                 return 0
+
             cur = self._conn.execute(
-                "DELETE FROM memories WHERE importance < ?",
-                (self._params.decay_floor,),
+                "SELECT id, importance, last_access, origin FROM memories"
             )
-            self._conn.commit()
-            return cur.rowcount
+            rows = cur.fetchall()
+
+            to_delete = []
+            for row in rows:
+                decayed = apply_decay(
+                    row["importance"], row["last_access"], now, self._params
+                )
+                effective_floor = self._effective_floor(row["origin"])
+                if decayed < effective_floor:
+                    to_delete.append(row["id"])
+
+            if to_delete:
+                placeholders = ",".join("?" * len(to_delete))
+                cur = self._conn.execute(
+                    f"DELETE FROM memories WHERE id IN ({placeholders})",
+                    to_delete,
+                )
+                self._conn.commit()
+                return cur.rowcount
+            return 0
 
     def count(self, target: Optional[str] = None) -> int:
         """Count memories, optionally filtered by target."""

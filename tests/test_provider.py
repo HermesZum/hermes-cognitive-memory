@@ -187,7 +187,8 @@ class TestSessionLifecycle:
         provider.on_session_switch("new-session", reset=True)
         assert provider._session_id == "new-session"
 
-    def test_sync_turn_applies_decay(self, provider):
+    def test_sync_turn_does_not_modify_importance(self, provider):
+        """sync_turn no longer modifies stored importance — decay is computed on the fly."""
         mem_id = provider._store.add("memory", "decaying memory", origin="user_preference")
         # Set last_access to 1 day ago
         import time
@@ -200,4 +201,5 @@ class TestSessionLifecycle:
         before = provider._store.get(mem_id)["importance"]
         provider.sync_turn("user msg", "assistant msg")
         after = provider._store.get(mem_id)["importance"]
-        assert after < before
+        # Stored importance should NOT change — decay is computed at retrieval time
+        assert after == before
