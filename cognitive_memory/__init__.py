@@ -75,8 +75,10 @@ _STATS_SCHEMA = {
 _REMEMBER_SCHEMA = {
     "name": "cognitive_remember",
     "description": (
-        "Store an explicit fact to cognitive memory with importance and "
-        "origin metadata. Use this for things the user states as durable facts."
+        "Store an explicit fact to cognitive memory with importance, "
+        "origin, and reliability metadata. Use this for things the user "
+        "states as durable facts, research findings, or hard-to-find "
+        "information that should be preserved."
     ),
     "parameters": {
         "type": "object",
@@ -92,6 +94,7 @@ _REMEMBER_SCHEMA = {
                 "enum": [
                     "user_correction",
                     "user_preference",
+                    "research_finding",
                     "environment_fact",
                     "agent_inference",
                 ],
@@ -101,6 +104,28 @@ _REMEMBER_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Optional tags for categorization.",
+            },
+            "reliability": {
+                "type": "number",
+                "description": (
+                    "How trustworthy the source is, 0-1. "
+                    "Research from reliable sources: 0.8-1.0. "
+                    "Casual inferences: 0.3-0.5. Default: 1.0."
+                ),
+            },
+            "hard_to_find": {
+                "type": "boolean",
+                "description": (
+                    "True if this information was difficult to find and would "
+                    "be hard to rediscover. Gets extra protection from decay."
+                ),
+            },
+            "pinned": {
+                "type": "boolean",
+                "description": (
+                    "True to permanently protect this memory from pruning. "
+                    "Use only for critical information that must never be lost."
+                ),
             },
         },
         "required": ["content"],
@@ -135,13 +160,13 @@ def _load_cognitive_config() -> Dict[str, Any]:
 def _build_params(config: Dict[str, Any]) -> DecayParams:
     """Build DecayParams from config dict."""
     return DecayParams(
-        decay_rate=config.get("decay_rate", 0.15),
+        decay_rate=config.get("decay_rate", 0.02),
         decay_floor=config.get("decay_floor", 0.05),
         access_boost=config.get("access_boost", 0.3),
         max_context=config.get("max_context", 15),
         reconsolidation_rate=config.get("reconsolidation_rate", 0.1),
         rif_penalty=config.get("rif_penalty", 0.05),
-        confidence_decay_rate=config.get("confidence_decay_rate", 0.02),
+        confidence_decay_rate=config.get("confidence_decay_rate", 0.002),
     )
 
 
@@ -377,13 +402,26 @@ class CognitiveMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Mirror built-in memory writes to the cognitive store."""
+        """Mirror built-in memory writes to the cognitive store.
+
+        Metadata can include:
+        - write_origin / origin: override origin classification
+        - reliability: 0-1 trust score (default 1.0)
+        - hard_to_find: bool, extra decay protection
+        - pinned: bool, never prune
+        """
         if not self._store:
             return
         if not content:
             return
 
         origin = classify_origin(action, target, content, metadata)
+
+        # Extract optional cognitive metadata
+        meta = metadata or {}
+        reliability = float(meta.get("reliability", 1.0))
+        hard_to_find = bool(meta.get("hard_to_find", False))
+        pinned = bool(meta.get("pinned", False))
 
         try:
             if action == "add":
@@ -392,26 +430,29 @@ class CognitiveMemoryProvider(MemoryProvider):
                     content=content,
                     origin=origin,
                     tags=[],
+                    reliability=reliability,
+                    hard_to_find=hard_to_find,
+                    pinned=pinned,
                 )
                 logger.debug(
-                    "cognitive-memory: mirrored add (id=%s, origin=%s)", mem_id, origin
+                    "cognitive-memory: mirrored add (id=%s, origin=%s, "
+                    "reliability=%.2f, pinned=%s)",
+                    mem_id, origin, reliability, pinned,
                 )
             elif action == "replace":
-                # For replace, we find the old entry by content substring and
-                # update it. The built-in memory tool passes the old_text
-                # identifying the entry, but on_memory_write only gets the
-                # new content. We store the new content as a new entry and
-                # let the old one decay naturally — this is more robust than
-                # trying to match exact entries.
                 self._store.add(
                     target=target,
                     content=content,
                     origin=origin,
                     tags=[],
+                    reliability=reliability,
+                    hard_to_find=hard_to_find,
+                    pinned=pinned,
                 )
-                logger.debug("cognitive-memory: mirrored replace as new add (origin=%s)", origin)
+                logger.debug(
+                    "cognitive-memory: mirrored replace as new add (origin=%s)", origin
+                )
             elif action == "remove":
-                # For remove, try to match by content substring
                 count = self._store.remove_by_content(content[:80])
                 logger.debug("cognitive-memory: mirrored remove (matched %d)", count)
         except Exception:
@@ -428,7 +469,7 @@ class CognitiveMemoryProvider(MemoryProvider):
                 "key": "decay_rate",
                 "description": "How fast memories fade (0-1, higher = faster)",
                 "type": "number",
-                "default": 0.15,
+                "default": 0.02,
                 "minimum": 0.0,
                 "maximum": 1.0,
                 "step": 0.01,
@@ -482,8 +523,11 @@ class CognitiveMemoryProvider(MemoryProvider):
                     "content": mem["content"][:500],
                     "importance": round(mem["importance"], 3),
                     "confidence": round(mem["confidence"], 3),
+                    "reliability": mem.get("reliability", 1.0),
                     "access_count": mem["access_count"],
                     "origin": mem["origin"],
+                    "pinned": bool(mem.get("pinned", 0)),
+                    "hard_to_find": bool(mem.get("hard_to_find", 0)),
                     "relevance_score": round(score, 4),
                 }
                 for mem, score in results
@@ -497,13 +541,18 @@ class CognitiveMemoryProvider(MemoryProvider):
         user_count = self._store.count("user")
         total_chars = self._store.total_chars()
 
-        # Get average importance
+        # Get all memories for stats
         all_mems = self._store.get_all()
         avg_importance = (
             sum(m["importance"] for m in all_mems) / len(all_mems)
             if all_mems else 0.0
         )
-        prunable = sum(1 for m in all_mems if m["importance"] < self._params.decay_floor)
+        prunable = sum(
+            1 for m in all_mems
+            if not m.get("pinned", 0) and m["importance"] < self._params.decay_floor
+        )
+        pinned_count = sum(1 for m in all_mems if m.get("pinned", 0))
+        hard_to_find_count = sum(1 for m in all_mems if m.get("hard_to_find", 0))
 
         # Top 5 by importance
         top_5 = sorted(all_mems, key=lambda m: m["importance"], reverse=True)[:5]
@@ -515,6 +564,8 @@ class CognitiveMemoryProvider(MemoryProvider):
             "total_chars": total_chars,
             "avg_importance": round(avg_importance, 3),
             "prunable_count": prunable,
+            "pinned_count": pinned_count,
+            "hard_to_find_count": hard_to_find_count,
             "decay_floor": self._params.decay_floor,
             "top_memories": [
                 {
@@ -522,6 +573,9 @@ class CognitiveMemoryProvider(MemoryProvider):
                     "importance": round(m["importance"], 3),
                     "origin": m["origin"],
                     "access_count": m["access_count"],
+                    "reliability": m.get("reliability", 1.0),
+                    "pinned": bool(m.get("pinned", 0)),
+                    "hard_to_find": bool(m.get("hard_to_find", 0)),
                 }
                 for m in top_5
             ],
@@ -533,21 +587,40 @@ class CognitiveMemoryProvider(MemoryProvider):
         target = args.get("target", "memory")
         origin = args.get("origin", "agent_inference")
         tags = args.get("tags", [])
+        reliability = args.get("reliability", 1.0)
+        hard_to_find = args.get("hard_to_find", False)
+        pinned = args.get("pinned", False)
 
         # Validate enum values
         if target not in ("memory", "user"):
             target = "memory"
-        valid_origins = ("user_correction", "user_preference", "environment_fact", "agent_inference")
+        valid_origins = (
+            "user_correction", "user_preference", "research_finding",
+            "environment_fact", "agent_inference",
+        )
         if origin not in valid_origins:
             origin = "agent_inference"
+
+        # Clamp reliability to [0, 1]
+        reliability = max(0.0, min(1.0, float(reliability)))
 
         mem_id = self._store.add(
             target=target,
             content=content,
             origin=origin,
             tags=tags,
+            reliability=reliability,
+            hard_to_find=bool(hard_to_find),
+            pinned=bool(pinned),
         )
-        return json.dumps({"status": "stored", "id": mem_id, "origin": origin})
+        return json.dumps({
+            "status": "stored",
+            "id": mem_id,
+            "origin": origin,
+            "reliability": reliability,
+            "hard_to_find": bool(hard_to_find),
+            "pinned": bool(pinned),
+        })
 
     def _handle_forget(self, args: Dict[str, Any]) -> str:
         mem_id = args.get("memory_id", "")

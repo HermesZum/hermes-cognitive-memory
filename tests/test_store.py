@@ -295,3 +295,158 @@ class TestStats:
         store.add("memory", "hello")  # 5 chars
         store.add("memory", "world!")  # 6 chars
         assert store.total_chars() == 11
+
+
+class TestPinnedProtection:
+    """Pinned memories are never pruned, regardless of decay."""
+
+    def test_pinned_memory_not_pruned(self, store):
+        """A pinned memory with very low importance should NOT be pruned."""
+        mem_id = store.add(
+            "memory", "critical fact", origin="agent_inference",
+            pinned=True,
+        )
+        # Force importance to near-zero and last_access to very old
+        store._conn.execute(
+            "UPDATE memories SET importance = 0.001, last_access = 0 WHERE id = ?",
+            (mem_id,),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        assert pruned == 0
+        assert store.get(mem_id) is not None
+
+    def test_pinned_not_counted_as_prunable(self, store):
+        """Pinned memories should not be counted in apply_global_decay."""
+        mem_id = store.add(
+            "memory", "pinned fact", origin="agent_inference",
+            pinned=True,
+        )
+        store._conn.execute(
+            "UPDATE memories SET importance = 0.001, last_access = 0 WHERE id = ?",
+            (mem_id,),
+        )
+        store._conn.commit()
+
+        prunable = store.apply_global_decay()
+        assert prunable == 0
+
+    def test_non_pinned_with_same_importance_is_pruned(self, store):
+        """Non-pinned memory with same low importance SHOULD be pruned."""
+        pinned_id = store.add("memory", "pinned", origin="agent_inference", pinned=True)
+        normal_id = store.add("memory", "normal", origin="agent_inference")
+
+        # Set both to near-zero importance
+        store._conn.execute(
+            "UPDATE memories SET importance = 0.001, last_access = 0 WHERE id IN (?, ?)",
+            (pinned_id, normal_id),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        assert pruned == 1
+        assert store.get(pinned_id) is not None
+        assert store.get(normal_id) is None
+
+
+class TestHardToFindProtection:
+    """Hard-to-find memories get a lower decay floor (0.01)."""
+
+    def test_hard_to_find_survives_longer(self, store):
+        """Hard-to-find memory should survive when a normal one is pruned."""
+        htf_id = store.add(
+            "memory", "rare finding", origin="agent_inference",
+            hard_to_find=True,
+        )
+        normal_id = store.add("memory", "common fact", origin="agent_inference")
+
+        # Set both to 25 days old — normal agent_inference decays to ~0.04 (below 0.05)
+        # but hard-to-find has floor 0.01, so it survives
+        old_time = time.time() - 86400 * 25
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id IN (?, ?)",
+            (old_time, htf_id, normal_id),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        # Normal one is pruned, hard-to-find survives
+        assert pruned == 1
+        assert store.get(htf_id) is not None
+        assert store.get(normal_id) is None
+
+    def test_hard_to_find_gets_importance_boost(self, store):
+        """Hard-to-find memories get +0.15 importance on creation."""
+        htf_id = store.add(
+            "memory", "rare", origin="environment_fact", hard_to_find=True,
+        )
+        normal_id = store.add("memory", "common", origin="environment_fact")
+
+        htf = store.get(htf_id)
+        normal = store.get(normal_id)
+        assert htf["importance"] > normal["importance"]
+        assert htf["importance"] == pytest.approx(normal["importance"] + 0.15, abs=0.01)
+
+
+class TestReliabilityRanking:
+    """Reliability score multiplies into search ranking."""
+
+    def test_reliable_source_ranks_higher(self, store):
+        """A memory with higher reliability should rank higher than one with lower."""
+        reliable_id = store.add(
+            "memory", "EURUSD correlation with DXY",
+            origin="research_finding", reliability=0.95,
+        )
+        unreliable_id = store.add(
+            "memory", "EURUSD correlation with DXY",
+            origin="research_finding", reliability=0.3,
+        )
+
+        results = store.search("EURUSD correlation")
+        assert len(results) >= 2
+
+        # The reliable one should rank higher
+        top_mem = results[0][0]
+        assert top_mem["id"] == reliable_id
+
+    def test_default_reliability_is_1(self, store):
+        """Memories created without reliability should default to 1.0."""
+        mem_id = store.add("memory", "test content", origin="environment_fact")
+        mem = store.get(mem_id)
+        assert mem["reliability"] == 1.0
+
+
+class TestResearchFindingProtection:
+    """Research findings get a lower decay floor (0.03), like user preferences."""
+
+    def test_research_finding_survives_longer_than_inference(self, store):
+        """Research findings should survive when agent inferences are pruned."""
+        research_id = store.add(
+            "memory", "backtested study evidence finding",
+            origin="research_finding",
+        )
+        inference_id = store.add(
+            "memory", "maybe it works",
+            origin="agent_inference",
+        )
+
+        # Set both to 20 days old
+        # research_finding: starts 0.80, floor 0.03 → decays to ~0.31 (survives)
+        # agent_inference: starts 0.35, floor 0.05 → decays to ~0.14 (survives)
+        # Need more time for inference to hit 0.05:
+        # 0.35 * 1/(1+0.02*hours) < 0.05 → hours > 300 → ~12.5 days
+        # 0.80 * 1/(1+0.02*hours) < 0.03 → hours > 1283 → ~53 days
+        # So at 15 days: research=~0.39, inference=~0.06 (pruned)
+        old_time = time.time() - 86400 * 15
+        store._conn.execute(
+            "UPDATE memories SET last_access = ? WHERE id IN (?, ?)",
+            (old_time, research_id, inference_id),
+        )
+        store._conn.commit()
+
+        pruned = store.prune()
+        # Inference is pruned, research survives
+        assert pruned == 1
+        assert store.get(research_id) is not None
+        assert store.get(inference_id) is None

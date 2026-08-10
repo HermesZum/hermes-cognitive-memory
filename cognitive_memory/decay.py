@@ -66,6 +66,7 @@ class DecayParams:
             self.source_confidence_defaults = {
                 "user_correction": 1.0,
                 "user_preference": 0.9,
+                "research_finding": 0.85,
                 "environment_fact": 0.7,
                 "agent_inference": 0.4,
                 "unknown": 0.5,
@@ -82,6 +83,7 @@ def initial_importance(origin: str, params: DecayParams) -> float:
     defaults = {
         "user_correction": 0.95,
         "user_preference": 0.85,
+        "research_finding": 0.80,
         "environment_fact": 0.6,
         "agent_inference": 0.35,
         "unknown": 0.5,
@@ -202,17 +204,21 @@ def classify_origin(
 ) -> str:
     """Classify the origin of a memory write.
 
-    Returns one of: user_correction, user_preference, environment_fact,
-    agent_inference, unknown.
+    Returns one of: user_correction, user_preference, research_finding,
+    environment_fact, agent_inference, unknown.
 
-    This is a heuristic classifier based on the action, target, and content.
+    Research findings are detected by keywords indicating sourced, verified,
+    or hard-to-find information (e.g. "research", "study", "data shows",
+    "according to", "found that", "evidence"). This can be overridden by
+    passing origin="research_finding" in metadata.
     """
     if metadata:
-        origin = metadata.get("write_origin", "")
-        if origin == "user_correction":
-            return "user_correction"
-        if origin == "user_preference":
-            return "user_preference"
+        origin = metadata.get("write_origin", metadata.get("origin", ""))
+        if origin in (
+            "user_correction", "user_preference", "research_finding",
+            "environment_fact", "agent_inference",
+        ):
+            return origin
 
     # Heuristic: if the action is 'replace' or 'remove', it's likely a
     # correction (the user is changing something).
@@ -227,6 +233,20 @@ def classify_origin(
     ]
     if any(word in content_lower for word in preference_indicators):
         return "user_preference"
+
+    # Research finding indicators — content that references sources, data,
+    # studies, or verified information from reliable fonts.
+    research_indicators = [
+        "research", "study", "studies", "data shows", "data show",
+        "according to", "found that", "evidence", "analysis shows",
+        "report", "benchmark", "measured", "tested", "verified",
+        "source:", "reliable", "documented", "finding", "findings",
+        "survey", "statistics", "correlation", "backtested",
+        "win rate", "expectancy", "sharpe", "drawdown",
+    ]
+    research_count = sum(1 for w in research_indicators if w in content_lower)
+    if research_count >= 2:
+        return "research_finding"
 
     # If the content describes the environment (paths, config, setup)
     environment_indicators = [

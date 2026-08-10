@@ -150,9 +150,51 @@ class TestOriginClassification:
         )
         assert result == "user_correction"
 
+    def test_metadata_origin_override(self):
+        """Test that 'origin' key in metadata also works."""
+        result = classify_origin(
+            "add", "memory", "some content",
+            metadata={"origin": "research_finding"},
+        )
+        assert result == "research_finding"
+
     def test_unknown_defaults_to_inference(self):
         result = classify_origin("add", "memory", "some random content")
         assert result == "agent_inference"
+
+    def test_research_finding_detected_by_keywords(self):
+        """Content with 2+ research indicators should be classified as research_finding."""
+        result = classify_origin(
+            "add", "memory",
+            "Research study found that EURUSD has a correlation with DXY. "
+            "Evidence from backtested data shows win rate of 55%.",
+        )
+        assert result == "research_finding"
+
+    def test_research_finding_single_keyword_not_enough(self):
+        """A single research keyword should NOT trigger research classification."""
+        result = classify_origin(
+            "add", "memory",
+            "The research says it might work",
+        )
+        assert result != "research_finding"
+
+    def test_research_finding_fx_indicators(self):
+        """FX-specific terms like 'backtested', 'win rate', 'expectancy' trigger research."""
+        result = classify_origin(
+            "add", "memory",
+            "Strategy was backtested over 2 years. Win rate is 58% with "
+            "positive expectancy and low drawdown.",
+        )
+        assert result == "research_finding"
+
+    def test_research_finding_metadata_override(self):
+        """Explicit origin=research_finding in metadata is respected."""
+        result = classify_origin(
+            "add", "memory", "some content",
+            metadata={"origin": "research_finding"},
+        )
+        assert result == "research_finding"
 
 
 class TestInitialImportance:
@@ -171,6 +213,17 @@ class TestInitialImportance:
         assert (
             initial_importance("user_correction", params)
             > initial_importance("user_preference", params)
+            > initial_importance("research_finding", params)
             > initial_importance("environment_fact", params)
             > initial_importance("agent_inference", params)
         )
+
+    def test_research_finding_starts_high(self):
+        """Research findings should start with high importance (0.80)."""
+        result = initial_importance("research_finding", DecayParams())
+        assert result >= 0.75
+
+    def test_research_finding_confidence(self):
+        """Research findings should have high source confidence (0.85)."""
+        result = initial_confidence("research_finding", DecayParams())
+        assert result >= 0.80

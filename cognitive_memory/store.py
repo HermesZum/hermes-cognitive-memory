@@ -45,13 +45,24 @@ CREATE TABLE IF NOT EXISTS memories (
     last_access   REAL NOT NULL,
     access_count  INTEGER DEFAULT 0,
     origin        TEXT NOT NULL DEFAULT 'unknown',
-    tags          TEXT DEFAULT '[]'
+    tags          TEXT DEFAULT '[]',
+    reliability   REAL NOT NULL DEFAULT 1.0,
+    hard_to_find  INTEGER NOT NULL DEFAULT 0,
+    pinned        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_target ON memories(target);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_last_access ON memories(last_access);
+CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned);
 """
+
+# Migration SQL for databases created before reliability/hard_to_find/pinned
+_MIGRATION_SQL = [
+    "ALTER TABLE memories ADD COLUMN reliability REAL NOT NULL DEFAULT 1.0",
+    "ALTER TABLE memories ADD COLUMN hard_to_find INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+]
 
 _FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -143,6 +154,13 @@ class MemoryStore:
                 else:
                     self._fts_available = True
                 conn.commit()
+                # Run migrations for pre-existing databases
+                for sql in _MIGRATION_SQL:
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                conn.commit()
             except Exception:
                 # If anything fails, close the connection before propagating
                 conn.close()
@@ -170,14 +188,31 @@ class MemoryStore:
         tags: Optional[List[str]] = None,
         importance: Optional[float] = None,
         confidence: Optional[float] = None,
+        reliability: float = 1.0,
+        hard_to_find: bool = False,
+        pinned: bool = False,
     ) -> str:
-        """Add a new memory. Returns the memory ID."""
+        """Add a new memory. Returns the memory ID.
+
+        Args:
+            reliability: 0-1, how trustworthy the source is (default 1.0).
+                Multiplies into search ranking. Research from reliable sources
+                should be 0.8-1.0; casual inferences should be 0.3-0.5.
+            hard_to_find: If True, this memory is flagged as difficult to
+                rediscover. It gets a lower decay floor and is protected from
+                pruning longer.
+            pinned: If True, this memory is never pruned regardless of decay.
+                Use for critical information that must never be lost.
+        """
         mem_id = str(uuid.uuid4())
         now = time.time()
         if importance is None:
             importance = initial_importance(origin, self._params)
         if confidence is None:
             confidence = initial_confidence(origin, self._params)
+        # Hard-to-find memories get an importance boost
+        if hard_to_find:
+            importance = min(1.0, importance + 0.15)
         tags_json = json.dumps(tags or [])
 
         with self._lock:
@@ -185,15 +220,18 @@ class MemoryStore:
             self._conn.execute(
                 """INSERT INTO memories
                    (id, target, content, importance, confidence,
-                    created_at, last_access, access_count, origin, tags)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                    created_at, last_access, access_count, origin, tags,
+                    reliability, hard_to_find, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
                 (mem_id, target, content, importance, confidence,
-                 now, now, origin, tags_json),
+                 now, now, origin, tags_json,
+                 reliability, int(hard_to_find), int(pinned)),
             )
             self._conn.commit()
         logger.debug(
-            "cognitive-memory: added memory %s (origin=%s, importance=%.2f)",
-            mem_id, origin, importance,
+            "cognitive-memory: added memory %s (origin=%s, importance=%.2f, "
+            "reliability=%.2f, pinned=%s)",
+            mem_id, origin, importance, reliability, pinned,
         )
         return mem_id
 
@@ -345,8 +383,10 @@ class MemoryStore:
                 decayed_confidence = apply_confidence_decay(
                     row["confidence"], row["last_access"], now, self._params
                 )
+                # Reliability multiplies into the score — reliable sources rank higher
+                reliability = row.get("reliability", 1.0)
 
-                score = normalized_fts * decayed_importance * decayed_confidence
+                score = normalized_fts * decayed_importance * decayed_confidence * reliability
                 scored.append((row, score))
 
             # Sort by cognitive score descending
@@ -393,7 +433,8 @@ class MemoryStore:
             decayed_confidence = apply_confidence_decay(
                 row["confidence"], row["last_access"], now, self._params
             )
-            score = decayed_importance * decayed_confidence
+            reliability = row.get("reliability", 1.0)
+            score = decayed_importance * decayed_confidence * reliability
             scored.append((row, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -441,7 +482,8 @@ class MemoryStore:
                 decayed_confidence = apply_confidence_decay(
                     row["confidence"], row["last_access"], now, self._params
                 )
-                score = decayed_importance * decayed_confidence
+                reliability = row.get("reliability", 1.0)
+                score = decayed_importance * decayed_confidence * reliability
                 scored.append((row, score))
 
             scored.sort(key=lambda x: x[1], reverse=True)
@@ -500,12 +542,7 @@ class MemoryStore:
         Returns count of prunable memories. Does NOT modify stored importance —
         decay is computed on the fly at retrieval/pruning time, never stored.
 
-        This avoids two bugs:
-        1. Compounding: applying decay repeatedly to already-decayed values
-        2. Double-decay: search() applying decay again on stored decayed values
-
-        Stored importance only changes via retrieval effects (access boost,
-        reconsolidation) — never via time-based decay.
+        Pinned memories are never counted as prunable.
         """
         now = time.time()
         prunable = 0
@@ -515,36 +552,49 @@ class MemoryStore:
                 return 0
 
             cur = self._conn.execute(
-                "SELECT id, importance, last_access, origin FROM memories"
+                "SELECT id, importance, last_access, origin, pinned, hard_to_find FROM memories"
             )
             rows = cur.fetchall()
 
             for row in rows:
+                if row["pinned"]:
+                    continue
                 decayed = apply_decay(
                     row["importance"], row["last_access"], now, self._params
                 )
-                effective_floor = self._effective_floor(row["origin"])
+                effective_floor = self._effective_floor(
+                    row["origin"], bool(row["hard_to_find"])
+                )
                 if decayed < effective_floor:
                     prunable += 1
 
         return prunable
 
-    def _effective_floor(self, origin: str) -> float:
+    def _effective_floor(self, origin: str, hard_to_find: bool = False) -> float:
         """Get the effective decay floor for a memory based on its origin.
 
-        Important memories (user corrections, preferences) get a LOWER floor,
-        meaning they can decay further before being pruned. This protects
+        Important memories (user corrections, preferences, research) get a LOWER
+        floor, meaning they can decay further before being pruned. This protects
         them — a user_correction starting at 0.95 with floor 0.02 survives
         much longer than an agent_inference at 0.35 with floor 0.05.
 
-        - user_correction: 0.02 (survives ~45+ days without access)
-        - user_preference: 0.03 (survives ~35+ days without access)
+        Hard-to-find memories get an even lower floor (0.01) regardless of origin,
+        because they are difficult to rediscover if lost.
+
+        - user_correction: 0.02 (survives ~97 days without access)
+        - user_preference: 0.03 (survives ~57 days)
+        - research_finding: 0.03 (survives ~57 days)
         - environment_fact: 0.05 (default floor, ~23 days)
         - agent_inference: 0.05 (default floor, ~12.5 days)
+        - hard_to_find: 0.01 (survives ~200+ days, regardless of origin)
         """
+        if hard_to_find:
+            return 0.01
         if origin == "user_correction":
             return min(0.02, self._params.decay_floor)
         if origin == "user_preference":
+            return min(0.03, self._params.decay_floor)
+        if origin == "research_finding":
             return min(0.03, self._params.decay_floor)
         return self._params.decay_floor
 
@@ -553,6 +603,9 @@ class MemoryStore:
 
         Computes decayed importance on the fly — does not rely on stored
         importance being pre-decayed.
+
+        Pinned memories are NEVER pruned, regardless of decay level.
+        Hard-to-find memories get a lower floor (0.01) for extra protection.
         """
         now = time.time()
         with self._lock:
@@ -560,16 +613,21 @@ class MemoryStore:
                 return 0
 
             cur = self._conn.execute(
-                "SELECT id, importance, last_access, origin FROM memories"
+                "SELECT id, importance, last_access, origin, pinned, hard_to_find FROM memories"
             )
             rows = cur.fetchall()
 
             to_delete = []
             for row in rows:
+                # Pinned memories are never pruned
+                if row["pinned"]:
+                    continue
                 decayed = apply_decay(
                     row["importance"], row["last_access"], now, self._params
                 )
-                effective_floor = self._effective_floor(row["origin"])
+                effective_floor = self._effective_floor(
+                    row["origin"], bool(row["hard_to_find"])
+                )
                 if decayed < effective_floor:
                     to_delete.append(row["id"])
 
