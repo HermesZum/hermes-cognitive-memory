@@ -290,3 +290,52 @@ def test_config_overrides(sync, home):
     assert s2._compact_importance == 0.4
     assert s2._access_keep == 1
     assert s2.trigger_pct == 50
+
+
+# -- Data-loss window regression (audit finding) ----------------------------
+
+def test_plan_keep_hard_to_find_mirror(store, sync, home):
+    """hard_to_find mirrors NEVER leave the built-in file, even with a strong
+    mirror — the store floor (0.01) is a grace period, not a guarantee."""
+    content = (
+        "EURUSD shows 0.85 correlation with DXY index backtested over two "
+        "years with a fifty eight percent win rate and this is a long entry "
+        "that would otherwise qualify for removal by strength alone"
+    )
+    store.add(
+        "memory", content,
+        origin="research_finding", importance=0.95, hard_to_find=True,
+    )
+    _write_memory(home, "memory", [content])
+    plan = sync.build_plan("memory", 2200)
+    assert len(plan.keeps) == 1
+    assert plan.keeps[0].reason == "hard-to-find research — must remain visible"
+    assert len(plan.removes) == 0
+    assert len(plan.compacts) == 0
+
+
+def test_apply_pins_removed_mirror(store, sync, home):
+    """When a built-in copy is removed, its mirror is pinned so the store copy
+    is permanent — closing the decay-to-prune data-loss window."""
+    content = (
+        "hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui "
+        "upstream nesquena hermes-webui nginx subdomain hermes.lan.local "
+        "Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui"
+    )
+    mem_id = store.add("memory", content, origin="environment_fact", importance=0.95)
+    _write_memory(home, "memory", [content])
+    plan = sync.build_plan("memory", 2200)
+    assert len(plan.removes) == 1
+
+    sync.apply_plan(plan, dry_run=False)
+
+    # The mirror is now pinned -> prune() will never delete it
+    mem = store.get(mem_id)
+    assert mem is not None
+    assert bool(mem["pinned"]) is True
+
+    # And prune() leaves it alone even if importance decays to the floor
+    pruned = store.prune()
+    mem_after = store.get(mem_id)
+    assert mem_after is not None
+    assert bool(mem_after["pinned"]) is True

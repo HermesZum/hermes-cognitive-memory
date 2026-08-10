@@ -257,6 +257,17 @@ class BuiltinMemorySync:
                 mirror_importance=eff_importance, mirror_access=mirror_access,
             )
 
+        # Invariant 2c: hard-to-find memories are explicitly protected by the
+        # user ("hard to find but reliable -> preserve"). They NEVER leave the
+        # built-in file; the store floor (0.01) is a grace period, not a
+        # guarantee, so we do not rely on it.
+        if bool(mirror.get("hard_to_find", 0)):
+            return EntryDecision(
+                entry=entry, action="keep", reason="hard-to-find research — must remain visible",
+                mirror_id=mirror_id, mirror_similarity=sim,
+                mirror_importance=eff_importance, mirror_access=mirror_access,
+            )
+
         # Invariant 3: mirror below safety floor -> keep (mirror may be pruned
         # next session; the built-in copy is the last surviving copy)
         floor = getattr(self._params, "decay_floor", 0.05)
@@ -363,7 +374,16 @@ class BuiltinMemorySync:
         for d in plan.decisions:
             if d.action == "compact" and d.replacement:
                 kept.append(d.replacement)
-        # 'remove' entries are simply not carried over
+        # 'remove' entries are not carried over — but their mirrors are pinned
+        # so the store copy is permanent (closes the data-loss window: a
+        # removed entry can never decay to the floor and be pruned later).
+        for d in plan.removes:
+            if d.mirror_id:
+                self._store.set_pinned(d.mirror_id, True)
+                logger.info(
+                    "cognitive-memory: SYNC removed built-in copy of %s, pinned mirror %s as permanent home",
+                    plan.target, d.mirror_id,
+                )
 
         new_content = ENTRY_DELIMITER.join(kept) if kept else ""
         path = plan.built_in_path

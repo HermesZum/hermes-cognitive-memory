@@ -406,22 +406,31 @@ keep/compact/remove plan for each entry.
    always-injected critical rules — they stay even when a strong mirror
    exists. Removing them from the per-turn context would make them
    unavailable even though a searchable copy remains.
-4. **Decaying mirror → keep.** If the mirror's effective importance is below
+4. **Hard-to-find → keep.** `hard_to_find` memories never leave the built-in
+   file, even with a strong mirror — the store's lower floor (0.01) is a
+   grace period, not a guarantee. "Hard to find but reliable" is preserved
+   by construction.
+5. **Decaying mirror → keep.** If the mirror's effective importance is below
    the safety floor, the built-in copy is the last surviving copy.
-5. **Actively used → keep.** Entries whose mirror has `access_count >= 3`.
-6. **Backup first.** Both files are copied to `memories/backups/` before any
+6. **Actively used → keep.** Entries whose mirror has `access_count >= 3`.
+7. **Pin-on-remove.** When an entry IS removed, its mirror is pinned in the
+   store (`set_pinned`), so the removed detail lives permanently in the
+   cognitive store — it can never decay to the floor and be pruned later.
+   Removal means "detail now has a permanent home", never "detail is at risk".
+8. **Backup first.** Both files are copied to `memories/backups/` before any
    write.
-7. **Dry-run by default.** The plan is shown; `apply=true` is required to
+9. **Dry-run by default.** The plan is shown; `apply=true` is required to
    write. Every change is appended to `prune_log.md`.
 
 ### What gets trimmed
 
 Only **non-critical origins** (`environment_fact`, `agent_inference`,
-`research_finding`) with a **strong mirror** (effective importance ≥ 0.30)
-are removed from the built-in file — the full detail survives in the
-cognitive store. Medium-strength mirrors (0.15–0.30) get the entry compacted
-to a short pointer instead. Short entries (< 80 chars) are always kept (a
-pointer costs more than it saves).
+`research_finding` — and only those NOT marked `hard_to_find`) with a
+**strong mirror** (effective importance ≥ 0.30) are removed from the built-in
+file — the full detail survives in the cognitive store, permanently pinned.
+Medium-strength mirrors (0.15–0.30) get the entry compacted to a short
+pointer instead. Short entries (< 80 chars) are always kept (a pointer costs
+more than it saves).
 
 ### How to trigger
 
