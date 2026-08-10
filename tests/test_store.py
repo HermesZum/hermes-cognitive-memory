@@ -20,6 +20,102 @@ def store(tmp_path):
     s.close()
 
 
+_OLD_SCHEMA_SQL = """
+CREATE TABLE memories (
+    id            TEXT PRIMARY KEY,
+    target        TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    importance    REAL NOT NULL,
+    confidence    REAL NOT NULL,
+    created_at    REAL NOT NULL,
+    last_access   REAL NOT NULL,
+    access_count  INTEGER DEFAULT 0,
+    origin        TEXT NOT NULL DEFAULT 'unknown',
+    tags          TEXT DEFAULT '[]'
+);
+"""
+
+
+class TestMigration:
+    """Databases created by earlier plugin versions must migrate on connect."""
+
+    def _make_old_db(self, path, seed_content="old schema memory"):
+        import sqlite3
+
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_OLD_SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO memories (id, target, content, importance, confidence,"
+            " created_at, last_access, access_count, origin) VALUES"
+            " ('old-1', 'memory', ?, 0.8, 0.7, 0, 0, 0, 'user_preference')",
+            (seed_content,),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_connect_migrates_old_schema(self, tmp_path):
+        """Connecting to a pre-existing old-schema DB adds the new columns."""
+        db_path = tmp_path / "old.db"
+        self._make_old_db(db_path)
+        params = DecayParams(decay_rate=0.02, decay_floor=0.05)
+        s = MemoryStore(db_path, params)
+        s.connect()
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(db_path))
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)")]
+            conn.close()
+            for col in ("reliability", "hard_to_find", "pinned", "temporal",
+                        "superseded", "supersedes"):
+                assert col in cols, f"column {col} missing after migration"
+            # Existing row survived with defaults
+            mem = s.get("old-1")
+            assert mem is not None
+            assert not mem["pinned"]
+            assert mem["temporal"] == "stable"
+            assert mem["reliability"] == 1.0
+        finally:
+            s.close()
+
+    def test_pin_works_after_migration(self, tmp_path):
+        """set_pinned must work on a migrated old-schema DB."""
+        db_path = tmp_path / "old.db"
+        self._make_old_db(db_path)
+        params = DecayParams(decay_rate=0.02, decay_floor=0.05)
+        s = MemoryStore(db_path, params)
+        s.connect()
+        try:
+            assert s.set_pinned("old-1", True) is True
+            assert bool(s.get("old-1")["pinned"]) is True
+            assert s.set_pinned("old-1", False) is True
+            assert not s.get("old-1")["pinned"]
+        finally:
+            s.close()
+
+    def test_add_with_new_fields_after_migration(self, tmp_path):
+        """add() with the new fields must work on a migrated old-schema DB."""
+        db_path = tmp_path / "old.db"
+        self._make_old_db(db_path)
+        params = DecayParams(decay_rate=0.02, decay_floor=0.05)
+        s = MemoryStore(db_path, params)
+        s.connect()
+        try:
+            mem_id = s.add(
+                "memory", "new-style entry", origin="research_finding",
+                reliability=0.9, hard_to_find=True, pinned=True,
+                temporal="timeless",
+            )
+            mem = s.get(mem_id)
+            assert mem is not None
+            assert bool(mem["pinned"]) is True
+            assert bool(mem["hard_to_find"]) is True
+            assert mem["temporal"] == "timeless"
+            assert mem["reliability"] == 0.9
+        finally:
+            s.close()
+
+
 class TestAdd:
     def test_add_returns_id(self, store):
         mem_id = store.add("memory", "test content", origin="user_preference")

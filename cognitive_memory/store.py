@@ -153,9 +153,28 @@ class MemoryStore:
                 # Set a busy timeout so we don't immediately fail if another
                 # process holds a write lock — wait up to 5 seconds.
                 conn.execute("PRAGMA busy_timeout=5000")
-                # Create base table first (always works)
+                # Migrate pre-existing databases FIRST: ALTER TABLE ADD COLUMN
+                # must run before the base schema's CREATE INDEX statements,
+                # which reference the new columns. On a fresh DB these ALTERs
+                # fail harmlessly ("no such table") and are swallowed; on an
+                # old DB they add the missing columns so the indexes below
+                # can be created.
+                for sql in _MIGRATION_SQL:
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists (fresh DB) or table absent
+                conn.commit()
+                # Create base table + indexes (works after migration above)
                 conn.executescript(_BASE_SCHEMA_SQL)
                 # Try FTS5 — may fail if not compiled into SQLite
+                fts_existed = (
+                    conn.execute(
+                        "SELECT name FROM sqlite_master"
+                        " WHERE type='table' AND name='memories_fts'"
+                    ).fetchone()
+                    is not None
+                )
                 try:
                     conn.executescript(_FTS_SCHEMA_SQL)
                 except sqlite3.OperationalError as e:
@@ -166,13 +185,20 @@ class MemoryStore:
                     self._fts_available = False
                 else:
                     self._fts_available = True
-                conn.commit()
-                # Run migrations for pre-existing databases
-                for sql in _MIGRATION_SQL:
-                    try:
-                        conn.execute(sql)
-                    except sqlite3.OperationalError:
-                        pass  # Column already exists
+                    # If the FTS table was just created over pre-existing
+                    # content (e.g. an old-schema DB being migrated), its
+                    # index is empty/out of sync — rebuild it so the
+                    # AFTER UPDATE/INSERT triggers don't hit
+                    # "database disk image is malformed".
+                    if not fts_existed:
+                        has_rows = conn.execute(
+                            "SELECT EXISTS(SELECT 1 FROM memories)"
+                        ).fetchone()[0]
+                        if has_rows:
+                            conn.execute(
+                                "INSERT INTO memories_fts(memories_fts)"
+                                " VALUES('rebuild')"
+                            )
                 conn.commit()
             except Exception:
                 # If anything fails, close the connection before propagating
