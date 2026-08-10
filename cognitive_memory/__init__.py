@@ -31,6 +31,9 @@ from .decay import DecayParams, classify_origin
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
+# Force INFO level on our logger regardless of global Hermes log level
+# so hook execution is visible in agent.log for debugging.
+logger.setLevel(logging.INFO)
 
 __version__ = "0.1.0"
 
@@ -210,8 +213,9 @@ class CognitiveMemoryProvider(MemoryProvider):
 
         try:
             results = self._store.search(query, limit=self._params.max_context)
-        except Exception:
-            logger.debug("cognitive-memory: prefetch search failed", exc_info=True)
+            logger.info("cognitive-memory: prefetch OK (query=%r, results=%d)", query[:50], len(results))
+        except Exception as e:
+            logger.error("cognitive-memory: prefetch search FAILED: %s", e, exc_info=True)
             return ""
 
         if not results:
@@ -316,18 +320,17 @@ class CognitiveMemoryProvider(MemoryProvider):
         runs inline on the request thread, so it always executes.
         """
         if not self._store:
+            logger.info("cognitive-memory: on_turn_start SKIP (no store)")
             return
         # Skip for non-primary contexts (cron, subagent)
         if self._agent_context not in ("primary", ""):
+            logger.info("cognitive-memory: on_turn_start SKIP (context=%s)", self._agent_context)
             return
         try:
             prunable = self._store.apply_global_decay()
-            if prunable > 0:
-                logger.debug(
-                    "cognitive-memory: %d memories are prunable", prunable
-                )
-        except Exception:
-            logger.debug("cognitive-memory: on_turn_start decay failed", exc_info=True)
+            logger.info("cognitive-memory: on_turn_start OK (decay applied, prunable=%d)", prunable)
+        except Exception as e:
+            logger.error("cognitive-memory: on_turn_start decay FAILED: %s", e, exc_info=True)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """End-of-session: apply final decay and prune."""
