@@ -42,6 +42,7 @@ from agent.memory_provider import MemoryProvider
 
 from .decay import DecayParams, classify_origin, classify_temporal
 from .store import MemoryStore
+from .sync import BuiltinMemorySync
 
 logger = logging.getLogger(__name__)
 # Force INFO level on our logger regardless of global Hermes log level
@@ -170,6 +171,38 @@ _FORGET_SCHEMA = {
     },
 }
 
+_SYNC_SCHEMA = {
+    "name": "cognitive_sync_memory",
+    "description": (
+        "Compact the BUILT-IN Hermes memory files (MEMORY.md / USER.md) by "
+        "cross-referencing the cognitive store. Entries that are fully mirrored "
+        "in the cognitive store with strong importance are removed from the "
+        "built-in file (the cognitive store retains the detail); entries with "
+        "medium-importance mirrors are shortened to pointers. NEVER touches "
+        "entries with no mirror, pinned memories, or actively-used memories. "
+        "Dry-run by default — pass apply=true to actually rewrite the files "
+        "(a backup is made first and every change is logged)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["memory", "user", "both"],
+                "description": "Which built-in file to compact (default: both).",
+            },
+            "apply": {
+                "type": "boolean",
+                "description": (
+                    "False (default) = dry run, return the plan without writing. "
+                    "True = apply the plan (backs up files first, logs every change)."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
 
 def _load_cognitive_config() -> Dict[str, Any]:
     """Load config from memory.cognitive block in config.yaml."""
@@ -229,6 +262,19 @@ class CognitiveMemoryProvider(MemoryProvider):
         # Load config
         config = _load_cognitive_config()
         self._params = _build_params(config)
+
+        # Built-in memory char limits (memory.memory_char_limit / user_char_limit)
+        self._memory_char_limit = 2200
+        self._user_char_limit = 1375
+        try:
+            from hermes_cli.config import load_config_readonly
+            root_config = load_config_readonly()
+            mem_cfg = root_config.get("memory", {}) if isinstance(root_config, dict) else {}
+            if isinstance(mem_cfg, dict):
+                self._memory_char_limit = int(mem_cfg.get("memory_char_limit", 2200))
+                self._user_char_limit = int(mem_cfg.get("user_char_limit", 1375))
+        except Exception:
+            pass
 
         # Determine DB path
         if self._hermes_home:
@@ -329,7 +375,7 @@ class CognitiveMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return LLM-facing tool schemas."""
-        return [_SEARCH_SCHEMA, _STATS_SCHEMA, _REMEMBER_SCHEMA, _FORGET_SCHEMA]
+        return [_SEARCH_SCHEMA, _STATS_SCHEMA, _REMEMBER_SCHEMA, _FORGET_SCHEMA, _SYNC_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handle a cognitive memory tool call."""
@@ -345,6 +391,8 @@ class CognitiveMemoryProvider(MemoryProvider):
                 return self._handle_remember(args)
             elif tool_name == "cognitive_forget":
                 return self._handle_forget(args)
+            elif tool_name == "cognitive_sync_memory":
+                return self._handle_sync(args)
             else:
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
@@ -386,6 +434,9 @@ class CognitiveMemoryProvider(MemoryProvider):
             logger.info("cognitive-memory: on_turn_start OK (decay applied, prunable=%d)", prunable)
         except Exception as e:
             logger.error("cognitive-memory: on_turn_start decay FAILED: %s", e, exc_info=True)
+
+        # Propose (never auto-apply) compaction when built-in memory is full
+        self._check_builtin_sync()
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """End-of-session: apply final decay and prune."""
@@ -707,6 +758,87 @@ class CognitiveMemoryProvider(MemoryProvider):
         if deleted:
             return json.dumps({"status": "deleted", "id": mem_id})
         return json.dumps({"status": "not_found", "id": mem_id})
+
+    def _handle_sync(self, args: Dict[str, Any]) -> str:
+        """Compact the built-in memory files (dry-run by default).
+
+        Cross-references the cognitive store and produces a plan of
+        keep/compact/remove per built-in entry. With apply=true the plan
+        is written (backup first, every change logged).
+        """
+        target = args.get("target", "both")
+        apply = bool(args.get("apply", False))
+
+        if target not in ("memory", "user", "both"):
+            target = "both"
+
+        sync = self._build_sync()
+        if sync is None:
+            return json.dumps({"error": "Sync not available (no hermes_home)"})
+
+        targets = ["memory", "user"] if target == "both" else [target]
+        limits = {"memory": self._memory_char_limit, "user": self._user_char_limit}
+
+        plans = []
+        for t in targets:
+            plan = sync.build_plan(t, limits.get(t, 2200))
+            if apply:
+                report = sync.apply_plan(plan, dry_run=False)
+                plans.append({"plan": plan.to_dict(), "report": report})
+            else:
+                plans.append({"plan": plan.to_dict(), "report": None})
+
+        return json.dumps({
+            "dry_run": not apply,
+            "target": target,
+            "results": plans,
+            "note": (
+                "Apply with apply=true to rewrite the built-in files "
+                "(backup + prune log made automatically)."
+            ) if not apply else "Applied.",
+        }, indent=2)
+
+    # -- Sync helpers --------------------------------------------------------
+
+    def _build_sync(self) -> Optional[BuiltinMemorySync]:
+        """Build the BuiltinMemorySync instance, or None if not possible."""
+        if not self._store or not self._params:
+            return None
+        hermes_home = self._hermes_home or str(Path.home() / ".hermes")
+        config = _load_cognitive_config()
+        return BuiltinMemorySync(
+            Path(hermes_home), self._store, self._params, config,
+        )
+
+    def _check_builtin_sync(self) -> None:
+        """Propose (never auto-apply) compaction when built-in memory is full.
+
+        Called from on_turn_start: if MEMORY.md or USER.md exceeds the sync
+        trigger percentage, log a proposal with the plan summary so the agent
+        (or user) can run cognitive_sync_memory apply=true. Never applies
+        automatically — the user executes live changes.
+        """
+        try:
+            sync = self._build_sync()
+            if sync is None:
+                return
+            for target, limit in (
+                ("memory", self._memory_char_limit),
+                ("user", self._user_char_limit),
+            ):
+                pct = sync.usage_pct(target, limit)
+                if pct >= sync.trigger_pct:
+                    plan = sync.build_plan(target, limit)
+                    logger.warning(
+                        "cognitive-memory: %s.md at %.0f%% of %d-char limit — "
+                        "sync proposal: %d keep, %d compact, %d remove. "
+                        "Run cognitive_sync_memory (target=%s, apply=true) to compact.",
+                        target.capitalize(), pct, limit,
+                        len(plan.keeps), len(plan.compacts), len(plan.removes),
+                        target,
+                    )
+        except Exception:
+            logger.debug("cognitive-memory: sync check failed", exc_info=True)
 
 
 # -- Helpers --------------------------------------------------------------

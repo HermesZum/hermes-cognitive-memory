@@ -119,14 +119,15 @@ class TestOnMemoryWrite:
 
 
 class TestToolSchemas:
-    def test_returns_four_tools(self, provider):
+    def test_returns_five_tools(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 4
+        assert len(schemas) == 5
         names = [s["name"] for s in schemas]
         assert "cognitive_search" in names
         assert "cognitive_stats" in names
         assert "cognitive_remember" in names
         assert "cognitive_forget" in names
+        assert "cognitive_sync_memory" in names
 
 
 class TestHandleToolCall:

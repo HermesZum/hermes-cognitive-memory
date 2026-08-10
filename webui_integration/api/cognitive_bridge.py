@@ -75,17 +75,18 @@ def _prune_log_path(home: Path) -> Path:
 
 
 def _load_plugin_modules(home: Path):
-    """Load ``decay`` and ``store`` from the plugin dir without running its
-    package ``__init__.py`` (which imports Hermes Agent internals).
+    """Load ``decay``, ``store``, and ``sync`` from the plugin dir without
+    running its package ``__init__.py`` (which imports Hermes Agent internals).
 
-    Returns ``(store_module, decay_module)``.
+    Returns ``(store_module, decay_module, sync_module)``.
     """
     plugin_dir = _plugin_dir(home)
     pkg_name = "_cognitive_webui"
     store_mod = sys.modules.get(pkg_name + ".store")
     decay_mod = sys.modules.get(pkg_name + ".decay")
-    if store_mod is not None and decay_mod is not None:
-        return store_mod, decay_mod
+    sync_mod = sys.modules.get(pkg_name + ".sync")
+    if store_mod is not None and decay_mod is not None and sync_mod is not None:
+        return store_mod, decay_mod, sync_mod
 
     pkg = types.ModuleType(pkg_name)
     pkg.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
@@ -93,7 +94,8 @@ def _load_plugin_modules(home: Path):
 
     decay_mod = _load_single_module(pkg_name + ".decay", plugin_dir / "decay.py")
     store_mod = _load_single_module(pkg_name + ".store", plugin_dir / "store.py")
-    return store_mod, decay_mod
+    sync_mod = _load_single_module(pkg_name + ".sync", plugin_dir / "sync.py")
+    return store_mod, decay_mod, sync_mod
 
 
 def _load_single_module(name: str, path: Path):
@@ -151,7 +153,7 @@ def _get_store():
                 f"{db_path}. Restart Hermes with memory.provider=cognitive "
                 "to initialize it."
             )
-        store_module, decay_module = _load_plugin_modules(home)
+        store_module, decay_module, sync_module = _load_plugin_modules(home)
         params = _build_params(store_module, decay_module, home)
         store = store_module.MemoryStore(db_path, params)
         store.connect()
@@ -247,7 +249,7 @@ def handle_cognitive_get(handler, parsed=None) -> None:
     except Exception as exc:
         return j(handler, {"available": False, "reason": str(exc)})
 
-    _, decay_module = _load_plugin_modules(home)
+    _, decay_module, _ = _load_plugin_modules(home)
     params = _store_params
     now = time.time()
     rows = store.get_all()
@@ -267,12 +269,12 @@ def handle_cognitive_get(handler, parsed=None) -> None:
 
 
 def handle_cognitive_post(handler, body) -> None:
-    """POST /api/memory/cognitive — actions: pin, unpin, delete, add."""
+    """POST /api/memory/cognitive — actions: pin, unpin, delete, add, sync_plan, sync_apply."""
     if not isinstance(body, dict):
         return bad(handler, "JSON body required")
     action = body.get("action", "")
-    if action not in ("pin", "unpin", "delete", "add"):
-        return bad(handler, "action must be one of: pin, unpin, delete, add")
+    if action not in ("pin", "unpin", "delete", "add", "sync_plan", "sync_apply"):
+        return bad(handler, "action must be one of: pin, unpin, delete, add, sync_plan, sync_apply")
 
     home = _resolve_hermes_home()
     try:
@@ -297,6 +299,9 @@ def handle_cognitive_post(handler, body) -> None:
         if not ok:
             return bad(handler, "Memory not found", 404)
         return j(handler, {"ok": True, "action": "delete", "id": mem_id})
+
+    if action in ("sync_plan", "sync_apply"):
+        return _handle_sync_action(handler, body, store, home, apply=action == "sync_apply")
 
     # action == "add"
     content = body.get("content")
@@ -332,3 +337,49 @@ def handle_cognitive_post(handler, body) -> None:
         temporal=temporal,
     )
     return j(handler, {"ok": True, "action": "add", "id": mem_id})
+
+
+def _handle_sync_action(handler, body, store, home: Path, apply: bool) -> None:
+    """Build (and optionally apply) the built-in memory compaction plan.
+
+    sync_plan  -> dry-run: returns the keep/compact/remove plan per target.
+    sync_apply -> writes the plan (backup + prune log automatic).
+    """
+    target = body.get("target", "both")
+    if target not in ("memory", "user", "both"):
+        target = "both"
+
+    try:
+        _, decay_module, sync_module = _load_plugin_modules(home)
+    except Exception as exc:
+        return bad(handler, f"sync module unavailable: {exc}", 500)
+
+    params = _store_params
+    hermes_home = _resolve_hermes_home()
+    sync = sync_module.BuiltinMemorySync(hermes_home, store, params, {})
+
+    limits = {"memory": 2200, "user": 1375}
+    try:
+        from api.config import get_config_snapshot
+        cfg = get_config_snapshot()
+        mem_cfg = cfg.get("memory") if isinstance(cfg, dict) else {}
+        if isinstance(mem_cfg, dict):
+            limits["memory"] = int(mem_cfg.get("memory_char_limit", 2200))
+            limits["user"] = int(mem_cfg.get("user_char_limit", 1375))
+    except Exception:
+        pass
+
+    targets = ["memory", "user"] if target == "both" else [target]
+    results = []
+    for t in targets:
+        plan = sync.build_plan(t, limits.get(t, 2200))
+        report = sync.apply_plan(plan, dry_run=not apply) if apply else None
+        results.append({"plan": plan.to_dict(), "report": report})
+
+    return j(handler, {
+        "ok": True,
+        "action": "sync_apply" if apply else "sync_plan",
+        "target": target,
+        "dry_run": not apply,
+        "results": results,
+    })

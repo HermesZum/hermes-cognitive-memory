@@ -37,6 +37,7 @@ self-manages.
 | 12 | **Semantic dedup** | Near-duplicates (>85% similar) merge instead of piling up |
 | 13 | **Conflict supersession** | Contradictory new info supersedes stale memories |
 | 14 | **Prune log** | Every pruned memory is logged to `prune_log.md` for audit |
+| 15 | **Built-in memory sync** | Compacts `MEMORY.md` / `USER.md` against the store — removes/compacts only redundant non-critical entries, never critical rules |
 
 ## Install
 
@@ -365,6 +366,9 @@ Memory panel gains a **Cognitive Memory** section:
   pinned / hard-to-find checkboxes)
 - Stats chips: total / pinned / hard-to-find / prunable / superseded
 - Collapsible **prune log** viewer
+- **Compact built-in memory** — runs the sync planner (`sync_plan`, dry-run)
+  showing keep/compact/remove per entry, then `sync_apply` to write it
+  (backup + prune-log automatic)
 
 This is an optional integration — it only reads/writes the same SQLite store
 the plugin uses, and never imports Hermes Agent code into the WebUI process
@@ -383,6 +387,65 @@ sudo systemctl restart hermes-webui
 Full instructions, the exact patch locations, the API contract, and design
 notes are in [`webui_integration/INSTALL.md`](webui_integration/INSTALL.md).
 The reference files live under `webui_integration/static/`.
+
+## Built-in memory sync (compaction)
+
+The built-in Hermes memory (`MEMORY.md` / `USER.md`) is injected into every
+prompt and capped at a char limit (default 2200 / 1375). The plugin now
+**manages that lifecycle too** — not just its own store. `sync.py` reads the
+built-in files, cross-references the cognitive store, and produces a
+keep/compact/remove plan for each entry.
+
+### Safety invariants (never violated)
+
+1. **No mirror → keep.** An entry with no cognitive-store copy is never
+   removed (that would lose data).
+2. **Pinned → keep.** Pinned memories never leave the built-in file.
+3. **Critical origin → keep.** `user_correction` and `user_preference`
+   entries (FX graduation criteria, LESSONs, formatting rules) are the
+   always-injected critical rules — they stay even when a strong mirror
+   exists. Removing them from the per-turn context would make them
+   unavailable even though a searchable copy remains.
+4. **Decaying mirror → keep.** If the mirror's effective importance is below
+   the safety floor, the built-in copy is the last surviving copy.
+5. **Actively used → keep.** Entries whose mirror has `access_count >= 3`.
+6. **Backup first.** Both files are copied to `memories/backups/` before any
+   write.
+7. **Dry-run by default.** The plan is shown; `apply=true` is required to
+   write. Every change is appended to `prune_log.md`.
+
+### What gets trimmed
+
+Only **non-critical origins** (`environment_fact`, `agent_inference`,
+`research_finding`) with a **strong mirror** (effective importance ≥ 0.30)
+are removed from the built-in file — the full detail survives in the
+cognitive store. Medium-strength mirrors (0.15–0.30) get the entry compacted
+to a short pointer instead. Short entries (< 80 chars) are always kept (a
+pointer costs more than it saves).
+
+### How to trigger
+
+- **Agent tool:** `cognitive_sync_memory` (`target: memory|user|both`,
+  `apply: false|true`). Dry-run by default.
+- **WebUI:** Memory → Cognitive Memory → *Compact built-in memory* — see the
+  plan, then click *Apply compaction*.
+- **Auto-proposal:** `on_turn_start` logs a warning with the plan summary
+  whenever a built-in file exceeds `sync_trigger_pct` (default 85%) — it
+  proposes but never auto-applies. You (or the agent) decide.
+
+### Sync config keys
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sync_mirror_threshold` | 0.60 | Min similarity to consider an entry mirrored |
+| `sync_keep_importance` | 0.30 | Mirror above this = strong, safe to remove built-in copy |
+| `sync_compact_importance` | 0.15 | Mirror in [compact, keep) = shorten to pointer |
+| `sync_access_keep` | 3 | Entries accessed ≥ this are actively used → keep |
+| `sync_trigger_pct` | 85 | Auto-propose when built-in usage exceeds this % |
+
+```bash
+hermes config set memory.cognitive.sync_trigger_pct 85
+```
 
 ## Seeding existing memories
 

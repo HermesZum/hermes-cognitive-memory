@@ -133,6 +133,11 @@ class MemoryStore:
         # Prune log path — next to the DB
         self._prune_log_path = db_path.parent / "prune_log.md"
 
+    @property
+    def prune_log_path(self) -> Path:
+        """Path of the prune/change audit log (public accessor)."""
+        return self._prune_log_path
+
     def connect(self) -> None:
         """Open the database connection and ensure schema.
 
