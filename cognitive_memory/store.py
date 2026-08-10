@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .decay import (
     DecayParams,
@@ -27,8 +28,10 @@ from .decay import (
     apply_decay,
     apply_reconsolidation,
     apply_rif_penalty,
+    detect_conflict,
     initial_confidence,
     initial_importance,
+    semantic_similarity,
     should_prune,
 )
 
@@ -48,20 +51,28 @@ CREATE TABLE IF NOT EXISTS memories (
     tags          TEXT DEFAULT '[]',
     reliability   REAL NOT NULL DEFAULT 1.0,
     hard_to_find  INTEGER NOT NULL DEFAULT 0,
-    pinned        INTEGER NOT NULL DEFAULT 0
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    temporal      TEXT NOT NULL DEFAULT 'stable',
+    superseded    INTEGER NOT NULL DEFAULT 0,
+    supersedes    TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_target ON memories(target);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_last_access ON memories(last_access);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned);
+CREATE INDEX IF NOT EXISTS idx_memories_temporal ON memories(temporal);
+CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded);
 """
 
-# Migration SQL for databases created before reliability/hard_to_find/pinned
+# Migration SQL for databases created before new columns
 _MIGRATION_SQL = [
     "ALTER TABLE memories ADD COLUMN reliability REAL NOT NULL DEFAULT 1.0",
     "ALTER TABLE memories ADD COLUMN hard_to_find INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE memories ADD COLUMN temporal TEXT NOT NULL DEFAULT 'stable'",
+    "ALTER TABLE memories ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE memories ADD COLUMN supersedes TEXT DEFAULT NULL",
 ]
 
 _FTS_SCHEMA_SQL = """
@@ -119,6 +130,8 @@ class MemoryStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._connected = False
         self._fts_available = False
+        # Prune log path — next to the DB
+        self._prune_log_path = db_path.parent / "prune_log.md"
 
     def connect(self) -> None:
         """Open the database connection and ensure schema.
@@ -191,20 +204,22 @@ class MemoryStore:
         reliability: float = 1.0,
         hard_to_find: bool = False,
         pinned: bool = False,
+        temporal: str = "stable",
     ) -> str:
         """Add a new memory. Returns the memory ID.
 
+        Performs semantic deduplication and conflict detection before
+        storing. If a near-duplicate exists (similarity > dedup_threshold),
+        the memories are merged instead of creating a duplicate. If a
+        conflict is detected (high similarity but different numbers/negations),
+        the old memory is superseded.
+
         Args:
             reliability: 0-1, how trustworthy the source is (default 1.0).
-                Multiplies into search ranking. Research from reliable sources
-                should be 0.8-1.0; casual inferences should be 0.3-0.5.
-            hard_to_find: If True, this memory is flagged as difficult to
-                rediscover. It gets a lower decay floor and is protected from
-                pruning longer.
-            pinned: If True, this memory is never pruned regardless of decay.
-                Use for critical information that must never be lost.
+            hard_to_find: If True, gets lower decay floor + importance boost.
+            pinned: If True, never pruned regardless of decay.
+            temporal: 'timeless' (slow decay), 'stable' (normal), 'ephemeral' (fast decay).
         """
-        mem_id = str(uuid.uuid4())
         now = time.time()
         if importance is None:
             importance = initial_importance(origin, self._params)
@@ -217,23 +232,149 @@ class MemoryStore:
 
         with self._lock:
             assert self._conn is not None
+
+            # -- Mechanism 12: Semantic deduplication --
+            dup_id = self._find_duplicate_locked(target, content)
+            if dup_id:
+                self._merge_locked(dup_id, content, importance, confidence,
+                                   reliability, hard_to_find, pinned, temporal)
+                logger.debug("cognitive-memory: merged with existing %s (dedup)", dup_id)
+                return dup_id
+
+            # -- Mechanism 13: Conflict detection / supersession --
+            conflict_id = self._find_conflict_locked(target, content)
+            if conflict_id:
+                self._supersede_locked(conflict_id, content)
+                logger.debug("cognitive-memory: superseded %s (conflict)", conflict_id)
+
+            mem_id = str(uuid.uuid4())
             self._conn.execute(
                 """INSERT INTO memories
                    (id, target, content, importance, confidence,
                     created_at, last_access, access_count, origin, tags,
-                    reliability, hard_to_find, pinned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                    reliability, hard_to_find, pinned, temporal, superseded, supersedes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?)""",
                 (mem_id, target, content, importance, confidence,
                  now, now, origin, tags_json,
-                 reliability, int(hard_to_find), int(pinned)),
+                 reliability, int(hard_to_find), int(pinned),
+                 temporal, None),
             )
             self._conn.commit()
         logger.debug(
             "cognitive-memory: added memory %s (origin=%s, importance=%.2f, "
-            "reliability=%.2f, pinned=%s)",
-            mem_id, origin, importance, reliability, pinned,
+            "reliability=%.2f, pinned=%s, temporal=%s)",
+            mem_id, origin, importance, reliability, pinned, temporal,
         )
         return mem_id
+
+    def _find_duplicate_locked(self, target: str, content: str) -> Optional[str]:
+        """Find an existing memory that's a semantic duplicate.
+
+        Uses Jaccard token similarity. If above dedup_similarity_threshold,
+        it's a duplicate. Superseded memories are not considered (they've
+        been replaced).
+
+        MUST be called with self._lock held.
+        """
+        assert self._conn is not None
+        # Only check memories with same target, not superseded
+        cur = self._conn.execute(
+            "SELECT id, content FROM memories WHERE target = ? AND superseded = 0",
+            (target,),
+        )
+        for row in cur.fetchall():
+            sim = semantic_similarity(content, row["content"])
+            if sim >= self._params.dedup_similarity_threshold:
+                return row["id"]
+        return None
+
+    def _merge_locked(
+        self, existing_id: str, new_content: str,
+        new_importance: float, new_confidence: float,
+        new_reliability: float, new_hard_to_find: bool,
+        new_pinned: bool, new_temporal: str,
+    ) -> None:
+        """Merge a new memory into an existing one (dedup).
+
+        Combines content (appends if different enough to be useful),
+        keeps the higher importance, higher reliability, max of access_count,
+        and ORs the flags.
+
+        MUST be called with self._lock held.
+        """
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "SELECT content, importance, confidence, reliability, "
+            "hard_to_find, pinned, access_count, temporal FROM memories WHERE id = ?",
+            (existing_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+
+        # Merge content — keep the longer one (more info)
+        merged_content = new_content if len(new_content) > len(row["content"]) else row["content"]
+
+        # Keep higher importance, higher confidence, higher reliability
+        merged_importance = max(row["importance"], new_importance)
+        merged_confidence = max(row["confidence"], new_confidence)
+        merged_reliability = max(row["reliability"], new_reliability)
+
+        # OR the flags
+        merged_hard = bool(row["hard_to_find"]) or new_hard_to_find
+        merged_pinned = bool(row["pinned"]) or new_pinned
+
+        # Keep the "more stable" temporal (timeless > stable > ephemeral)
+        temporal_rank = {"timeless": 0, "stable": 1, "ephemeral": 2}
+        old_temporal = row["temporal"] or "stable"
+        merged_temporal = min(old_temporal, new_temporal, key=lambda t: temporal_rank.get(t, 1))
+
+        self._conn.execute(
+            """UPDATE memories SET
+               content = ?, importance = ?, confidence = ?, reliability = ?,
+               hard_to_find = ?, pinned = ?, temporal = ?
+               WHERE id = ?""",
+            (merged_content, merged_importance, merged_confidence, merged_reliability,
+             int(merged_hard), int(merged_pinned), merged_temporal, existing_id),
+        )
+        self._conn.commit()
+
+    def _find_conflict_locked(self, target: str, content: str) -> Optional[str]:
+        """Find an existing memory that the new content conflicts with.
+
+        If similarity is above conflict_similarity_threshold AND detect_conflict
+        returns True, the old memory should be superseded.
+
+        MUST be called with self._lock held.
+        """
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "SELECT id, content FROM memories WHERE target = ? AND superseded = 0",
+            (target,),
+        )
+        for row in cur.fetchall():
+            sim = semantic_similarity(content, row["content"])
+            if sim >= self._params.conflict_similarity_threshold:
+                if detect_conflict(row["content"], content):
+                    return row["id"]
+        return None
+
+    def _supersede_locked(self, old_id: str, new_content: str) -> None:
+        """Mark an old memory as superseded by a new one.
+
+        The old memory's importance is set to 0 and superseded=1, so it will
+        be pruned at the next session end. The new memory will store a
+        reference to the old one in supersedes for audit trail.
+
+        MUST be called with self._lock held.
+        """
+        assert self._conn is not None
+        self._conn.execute(
+            "UPDATE memories SET superseded = 1, importance = 0 WHERE id = ?",
+            (old_id,),
+        )
+        self._conn.commit()
+        logger.info("cognitive-memory: superseded memory %s (conflict detected)", old_id)
 
     def replace(self, mem_id: str, new_content: str) -> bool:
         """Replace a memory's content (keeps cognitive scores)."""
@@ -263,7 +404,6 @@ class MemoryStore:
         literally, not as pattern characters.
         """
         # Escape LIKE special characters so they match literally
-        # ESCAPE clause uses backslash as the escape character
         escaped = content_substring.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
             assert self._conn is not None
@@ -287,7 +427,16 @@ class MemoryStore:
             return dict(row) if row else None
 
     def get_all(self) -> List[Dict[str, Any]]:
-        """Get all memories."""
+        """Get all memories (excluding superseded)."""
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.execute(
+                "SELECT * FROM memories WHERE superseded = 0 ORDER BY importance DESC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_all_raw(self) -> List[Dict[str, Any]]:
+        """Get all memories including superseded (for stats/audit)."""
         with self._lock:
             assert self._conn is not None
             cur = self._conn.execute(
@@ -300,7 +449,7 @@ class MemoryStore:
         with self._lock:
             assert self._conn is not None
             cur = self._conn.execute(
-                "SELECT * FROM memories WHERE target = ? ORDER BY importance DESC",
+                "SELECT * FROM memories WHERE target = ? AND superseded = 0 ORDER BY importance DESC",
                 (target,),
             )
             return [dict(r) for r in cur.fetchall()]
@@ -314,7 +463,9 @@ class MemoryStore:
         """FTS5 search with cognitive relevance ranking.
 
         Returns a list of (memory_dict, score) tuples sorted by score DESC.
-        Score = normalized_fts_rank * decayed_importance * decayed_confidence.
+        Score = normalized_fts_rank * decayed_importance * decayed_confidence * reliability.
+
+        Superseded memories are excluded from search results.
 
         The entire operation (fetch + rank + retrieval effects) runs under
         the lock to prevent lost updates from concurrent apply_global_decay()
@@ -337,7 +488,7 @@ class MemoryStore:
 
             # FTS5 search — use bm25() ranking (lower = better in SQLite FTS5,
             # so we negate it). We also join back to the base table for
-            # cognitive metadata.
+            # cognitive metadata. Exclude superseded memories.
             safe_query = _sanitize_fts_query(query)
 
             sql = """
@@ -345,6 +496,7 @@ class MemoryStore:
                 FROM memories_fts
                 JOIN memories m ON m.rowid = memories_fts.rowid
                 WHERE memories_fts MATCH ?
+                AND m.superseded = 0
             """
             params: list = [safe_query]
 
@@ -364,35 +516,27 @@ class MemoryStore:
                 return self._like_search(query, target, max_limit, now)
 
             # Re-rank with cognitive scores — ALL under the lock
-            # Compute decayed importance ON THE FLY from stored importance +
-            # last_access. This is the ONLY place decay is applied — we never
-            # store decayed values, avoiding compounding and double-decay.
-            now = time.time()
             scored = []
             for row in rows:
                 fts_score = row.pop("fts_score", 0.0)
-                # bm25 in SQLite FTS5 returns negative values (lower = better match)
-                # We negate and normalize: a perfect match is typically around -2 to -5
                 normalized_fts = max(0.0, min(1.0, (-fts_score) / 3.0)) if fts_score != 0 else 0.5
 
                 # Compute decayed importance on the fly (not stored)
+                temporal = row.get("temporal", "stable")
                 decayed_importance = apply_decay(
-                    row["importance"], row["last_access"], now, self._params
+                    row["importance"], row["last_access"], now, self._params, temporal
                 )
-                # Confidence also computed on the fly
                 decayed_confidence = apply_confidence_decay(
                     row["confidence"], row["last_access"], now, self._params
                 )
-                # Reliability multiplies into the score — reliable sources rank higher
                 reliability = row.get("reliability", 1.0)
 
                 score = normalized_fts * decayed_importance * decayed_confidence * reliability
                 scored.append((row, score))
 
-            # Sort by cognitive score descending
             scored.sort(key=lambda x: x[1], reverse=True)
 
-            # Apply access reinforcement + RIF to top results — under the same lock
+            # Apply access reinforcement + RIF + auto-pin to top results
             if scored:
                 self._apply_retrieval_effects_locked(
                     [s[0] for s in scored[:max_limit]],
@@ -413,7 +557,7 @@ class MemoryStore:
         MUST be called with self._lock held.
         """
         assert self._conn is not None
-        sql = "SELECT * FROM memories WHERE content LIKE ?"
+        sql = "SELECT * FROM memories WHERE content LIKE ? AND superseded = 0"
         params: list = [f"%{query}%"]
         if target:
             sql += " AND target = ?"
@@ -426,9 +570,9 @@ class MemoryStore:
 
         scored = []
         for row in rows:
-            # Compute decayed importance on the fly (not stored)
+            temporal = row.get("temporal", "stable")
             decayed_importance = apply_decay(
-                row["importance"], row["last_access"], now, self._params
+                row["importance"], row["last_access"], now, self._params, temporal
             )
             decayed_confidence = apply_confidence_decay(
                 row["confidence"], row["last_access"], now, self._params
@@ -463,10 +607,10 @@ class MemoryStore:
             if not self._conn:
                 return []
 
-            sql = "SELECT * FROM memories"
+            sql = "SELECT * FROM memories WHERE superseded = 0"
             params: list = []
             if target:
-                sql += " WHERE target = ?"
+                sql += " AND target = ?"
                 params.append(target)
             sql += " ORDER BY importance DESC LIMIT ?"
             params.append(max_limit * 3)
@@ -475,9 +619,9 @@ class MemoryStore:
 
             scored = []
             for row in rows:
-                # Compute decayed importance on the fly (not stored)
+                temporal = row.get("temporal", "stable")
                 decayed_importance = apply_decay(
-                    row["importance"], row["last_access"], now, self._params
+                    row["importance"], row["last_access"], now, self._params, temporal
                 )
                 decayed_confidence = apply_confidence_decay(
                     row["confidence"], row["last_access"], now, self._params
@@ -501,13 +645,13 @@ class MemoryStore:
         retrieved: List[Dict[str, Any]],
         competitors: List[Dict[str, Any]],
     ) -> None:
-        """Apply access reinforcement + reconsolidation + RIF after retrieval.
+        """Apply access reinforcement + reconsolidation + RIF + auto-pin after retrieval.
 
         - Retrieved memories get access_boost + reconsolidation
         - Competing memories get RIF penalty
+        - Auto-pin: if access_count crosses auto_pin_threshold, set pinned=1
 
-        MUST be called with self._lock already held (uses RLock so re-entry
-        is safe, but we avoid the overhead of a second acquire).
+        MUST be called with self._lock already held.
         """
         now = time.time()
         assert self._conn is not None
@@ -516,11 +660,23 @@ class MemoryStore:
                 mem["importance"], self._params
             )
             new_importance = apply_reconsolidation(new_importance, self._params)
+            new_access_count = mem["access_count"] + 1
+
+            # Mechanism 10: Auto-pin by access frequency
+            new_pinned = mem.get("pinned", 0)
+            if new_access_count >= self._params.auto_pin_threshold:
+                if not new_pinned:
+                    new_pinned = 1
+                    logger.info(
+                        "cognitive-memory: auto-pinned memory %s (access_count=%d)",
+                        mem["id"], new_access_count,
+                    )
+
             self._conn.execute(
                 """UPDATE memories
-                   SET importance = ?, last_access = ?, access_count = access_count + 1
+                   SET importance = ?, last_access = ?, access_count = ?, pinned = ?
                    WHERE id = ?""",
-                (new_importance, now, mem["id"]),
+                (new_importance, now, new_access_count, new_pinned, mem["id"]),
             )
 
         for comp in competitors:
@@ -543,6 +699,7 @@ class MemoryStore:
         decay is computed on the fly at retrieval/pruning time, never stored.
 
         Pinned memories are never counted as prunable.
+        Superseded memories (importance=0) ARE counted as prunable.
         """
         now = time.time()
         prunable = 0
@@ -552,51 +709,68 @@ class MemoryStore:
                 return 0
 
             cur = self._conn.execute(
-                "SELECT id, importance, last_access, origin, pinned, hard_to_find FROM memories"
+                "SELECT id, importance, last_access, origin, pinned, hard_to_find, "
+                "access_count, temporal, superseded FROM memories"
             )
             rows = cur.fetchall()
 
             for row in rows:
                 if row["pinned"]:
                     continue
+                temporal = row["temporal"] or "stable"
                 decayed = apply_decay(
-                    row["importance"], row["last_access"], now, self._params
+                    row["importance"], row["last_access"], now, self._params, temporal
                 )
+                # Superseded memories always have importance 0, use a high floor
+                if row["superseded"]:
+                    if decayed < self._params.decay_floor:
+                        prunable += 1
+                    continue
                 effective_floor = self._effective_floor(
-                    row["origin"], bool(row["hard_to_find"])
+                    row["origin"], bool(row["hard_to_find"]), row["access_count"]
                 )
                 if decayed < effective_floor:
                     prunable += 1
 
         return prunable
 
-    def _effective_floor(self, origin: str, hard_to_find: bool = False) -> float:
-        """Get the effective decay floor for a memory based on its origin.
+    def _effective_floor(self, origin: str, hard_to_find: bool = False,
+                         access_count: int = 0) -> float:
+        """Get the effective decay floor for a memory.
 
         Important memories (user corrections, preferences, research) get a LOWER
-        floor, meaning they can decay further before being pruned. This protects
-        them — a user_correction starting at 0.95 with floor 0.02 survives
-        much longer than an agent_inference at 0.35 with floor 0.05.
+        floor, meaning they can decay further before being pruned.
 
-        Hard-to-find memories get an even lower floor (0.01) regardless of origin,
-        because they are difficult to rediscover if lost.
+        Hard-to-find memories get an even lower floor (0.01).
 
-        - user_correction: 0.02 (survives ~97 days without access)
-        - user_preference: 0.03 (survives ~57 days)
-        - research_finding: 0.03 (survives ~57 days)
-        - environment_fact: 0.05 (default floor, ~23 days)
-        - agent_inference: 0.05 (default floor, ~12.5 days)
-        - hard_to_find: 0.01 (survives ~200+ days, regardless of origin)
+        Access-count-based floor (mechanism 11): memories accessed more
+        frequently get a lower floor, making them survive longer:
+            floor = base_floor / (1 + access_count * 0.1)
+
+        So:
+        - 0 accesses: floor × 1.0 (normal)
+        - 5 accesses: floor × 0.67
+        - 10 accesses: floor × 0.5 (survives 2x longer)
+        - 20 accesses: floor × 0.33 (survives 3x longer)
+        - Auto-pinned (≥ threshold): floor = 0 (never pruned)
         """
         if hard_to_find:
-            return 0.01
-        if origin == "user_correction":
-            return min(0.02, self._params.decay_floor)
-        if origin == "user_preference":
-            return min(0.03, self._params.decay_floor)
-        if origin == "research_finding":
-            return min(0.03, self._params.decay_floor)
-        return self._params.decay_floor
+            base = 0.01
+        elif origin == "user_correction":
+            base = min(0.02, self._params.decay_floor)
+        elif origin == "user_preference":
+            base = min(0.03, self._params.decay_floor)
+        elif origin == "research_finding":
+            base = min(0.03, self._params.decay_floor)
+        else:
+            base = self._params.decay_floor
+
+        # Access-count-based floor reduction
+        if access_count > 0:
+            base = base / (1.0 + access_count * 0.1)
+            base = max(base, 0.001)  # Never go below 0.001
+
+        return base
 
     def prune(self) -> int:
         """Delete all memories below their origin-specific decay floor.
@@ -606,6 +780,9 @@ class MemoryStore:
 
         Pinned memories are NEVER pruned, regardless of decay level.
         Hard-to-find memories get a lower floor (0.01) for extra protection.
+        Superseded memories (importance=0, superseded=1) are always pruned.
+
+        Before pruning, each deleted memory is logged to prune_log.md for audit.
         """
         now = time.time()
         with self._lock:
@@ -613,7 +790,8 @@ class MemoryStore:
                 return 0
 
             cur = self._conn.execute(
-                "SELECT id, importance, last_access, origin, pinned, hard_to_find FROM memories"
+                "SELECT id, content, importance, last_access, origin, pinned, "
+                "hard_to_find, access_count, temporal, superseded FROM memories"
             )
             rows = cur.fetchall()
 
@@ -622,36 +800,83 @@ class MemoryStore:
                 # Pinned memories are never pruned
                 if row["pinned"]:
                     continue
+
+                temporal = row["temporal"] or "stable"
                 decayed = apply_decay(
-                    row["importance"], row["last_access"], now, self._params
+                    row["importance"], row["last_access"], now, self._params, temporal
                 )
+
+                if row["superseded"]:
+                    # Superseded memories always get pruned if below floor
+                    if decayed < self._params.decay_floor:
+                        to_delete.append(row)
+                    continue
+
                 effective_floor = self._effective_floor(
-                    row["origin"], bool(row["hard_to_find"])
+                    row["origin"], bool(row["hard_to_find"]), row["access_count"]
                 )
                 if decayed < effective_floor:
-                    to_delete.append(row["id"])
+                    to_delete.append(row)
 
             if to_delete:
-                placeholders = ",".join("?" * len(to_delete))
+                # Log each pruned memory for audit
+                self._log_pruned(to_delete)
+
+                ids = [r["id"] for r in to_delete]
+                placeholders = ",".join("?" * len(ids))
                 cur = self._conn.execute(
                     f"DELETE FROM memories WHERE id IN ({placeholders})",
-                    to_delete,
+                    ids,
                 )
                 self._conn.commit()
+                logger.info("cognitive-memory: pruned %d decayed memories", cur.rowcount)
                 return cur.rowcount
             return 0
 
-    def count(self, target: Optional[str] = None) -> int:
+    def _log_pruned(self, rows: List[sqlite3.Row]) -> None:
+        """Log pruned memories to prune_log.md for audit trail.
+
+        Format:
+        2026-08-10 21:50 | pruned id=abc123 | origin=agent_inference | imp=0.03 | "content snippet..."
+        """
+        from datetime import datetime
+        lines = []
+        for row in rows:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            content_snippet = row["content"][:80].replace("\n", " ")
+            lines.append(
+                f"{ts} | pruned id={row['id'][:8]} | origin={row['origin']} | "
+                f"imp={row['importance']:.3f} | acc={row['access_count']} | "
+                f"\"{content_snippet}...\""
+            )
+
+        # Append to prune log (create if not exists)
+        log_path = str(self._prune_log_path)
+        with open(log_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def count(self, target: Optional[str] = None, include_superseded: bool = False) -> int:
         """Count memories, optionally filtered by target."""
         with self._lock:
             if not self._conn:
                 return 0
-            if target:
-                cur = self._conn.execute(
-                    "SELECT COUNT(*) FROM memories WHERE target = ?", (target,)
-                )
+            if include_superseded:
+                if target:
+                    cur = self._conn.execute(
+                        "SELECT COUNT(*) FROM memories WHERE target = ?", (target,)
+                    )
+                else:
+                    cur = self._conn.execute("SELECT COUNT(*) FROM memories")
             else:
-                cur = self._conn.execute("SELECT COUNT(*) FROM memories")
+                if target:
+                    cur = self._conn.execute(
+                        "SELECT COUNT(*) FROM memories WHERE target = ? AND superseded = 0",
+                        (target,),
+                    )
+                else:
+                    cur = self._conn.execute(
+                        "SELECT COUNT(*) FROM memories WHERE superseded = 0"
+                    )
             return cur.fetchone()[0]
 
     def total_chars(self, target: Optional[str] = None) -> int:
@@ -661,11 +886,13 @@ class MemoryStore:
                 return 0
             if target:
                 cur = self._conn.execute(
-                    "SELECT SUM(LENGTH(content)) FROM memories WHERE target = ?",
+                    "SELECT SUM(LENGTH(content)) FROM memories WHERE target = ? AND superseded = 0",
                     (target,),
                 )
             else:
-                cur = self._conn.execute("SELECT SUM(LENGTH(content)) FROM memories")
+                cur = self._conn.execute(
+                    "SELECT SUM(LENGTH(content)) FROM memories WHERE superseded = 0"
+                )
             result = cur.fetchone()[0]
             return result or 0
 

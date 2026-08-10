@@ -11,14 +11,24 @@ and fade over time:
 6. Competition suppression — lower-rank competitors lose importance
 7. Importance-weighted retrieval — final relevance combines all factors
 8. Decay-floor pruning — memories below threshold are eligible for removal
+
+Additional triage mechanisms:
+
+9. Temporal relevance — timeless memories decay slower, ephemeral faster
+10. Auto-pinning by access frequency — frequently accessed memories self-protect
+11. Access-count decay floor — proven-valuable memories survive longer
+12. Semantic deduplication — near-duplicates merge instead of competing
+13. Conflict supersession — contradictory new memories supersede old ones
+14. Prune logging — deleted memories are logged for audit before removal
 """
 
 from __future__ import annotations
 
 import math
+import re
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Set
 
 
 @dataclass
@@ -28,7 +38,7 @@ class DecayParams:
     # 1. Ebbinghaus decay
     #   importance *= 1 / (1 + decay_rate * hours_elapsed)
     #   Higher = faster forgetting. 0.02 means ~2% per hour at baseline.
-    #   With rate=0.02: user corrections survive ~11 days without access,
+    #   With rate=0.02: user corrections survive ~97 days without access,
     #   agent inferences survive ~12.5 days. Accessed memories survive
     #   indefinitely (reinforcement boosts offset decay).
     decay_rate: float = 0.02
@@ -61,6 +71,22 @@ class DecayParams:
     # Default source confidence by origin type
     source_confidence_defaults: dict = None  # type: ignore
 
+    # 10. Auto-pinning — when access_count crosses this threshold,
+    #   the memory is automatically pinned (never pruned).
+    auto_pin_threshold: int = 5
+
+    # 9. Temporal decay multipliers — timeless memories decay slower,
+    #   ephemeral memories decay faster.
+    temporal_decay_multiplier: dict = None  # type: ignore
+
+    # 12. Semantic deduplication threshold — if Jaccard similarity
+    #   between new and existing memory exceeds this, merge instead of add.
+    dedup_similarity_threshold: float = 0.85
+
+    # 13. Conflict detection threshold — if similarity is above this but
+    #   below dedup threshold, and content conflicts, supersede the old.
+    conflict_similarity_threshold: float = 0.60
+
     def __post_init__(self):
         if self.source_confidence_defaults is None:
             self.source_confidence_defaults = {
@@ -70,6 +96,12 @@ class DecayParams:
                 "environment_fact": 0.7,
                 "agent_inference": 0.4,
                 "unknown": 0.5,
+            }
+        if self.temporal_decay_multiplier is None:
+            self.temporal_decay_multiplier = {
+                "timeless": 0.3,   # survives ~3x longer
+                "stable": 1.0,      # normal decay
+                "ephemeral": 3.0,   # clears ~3x faster
             }
 
 
@@ -101,6 +133,7 @@ def apply_decay(
     last_access: float,
     now: float,
     params: DecayParams,
+    temporal: str = "stable",
 ) -> float:
     """Apply Ebbinghaus decay to a memory's importance.
 
@@ -108,15 +141,24 @@ def apply_decay(
     curve): importance decays faster early on, then levels out. The rate is
     scaled by elapsed hours so it's intuitive to tune.
 
+    Temporal relevance adjusts the decay rate:
+    - timeless: rate × 0.3 (survives 3x longer)
+    - stable: normal rate (default)
+    - ephemeral: rate × 3.0 (clears 3x faster)
+
     Formula:
         elapsed_hours = (now - last_access) / 3600
-        stability = 1 / (1 + decay_rate * elapsed_hours)
+        multiplier = temporal_decay_multiplier[temporal]
+        effective_rate = decay_rate * multiplier
+        stability = 1 / (1 + effective_rate * elapsed_hours)
         new_importance = importance * stability
 
     Returns the decayed importance, clamped to [0, 1].
     """
     elapsed_hours = max(0.0, (now - last_access) / 3600.0)
-    stability = 1.0 / (1.0 + params.decay_rate * elapsed_hours)
+    multiplier = params.temporal_decay_multiplier.get(temporal, 1.0)
+    effective_rate = params.decay_rate * multiplier
+    stability = 1.0 / (1.0 + effective_rate * elapsed_hours)
     return max(0.0, min(1.0, importance * stability))
 
 
@@ -194,6 +236,113 @@ def apply_rif_penalty(
 def should_prune(importance: float, params: DecayParams) -> bool:
     """Check if a memory has decayed below the floor and should be pruned."""
     return importance < params.decay_floor
+
+
+# -- Temporal classification (mechanism 9) ---------------------------------
+
+_EPHEMERAL_INDICATORS = [
+    "still to be", "pending", "tbd", "temporary", "waiting for",
+    "not yet", "to be confirmed", "not confirmed", "wip", "draft",
+    "subject to change", "might change", "tentative", "preliminary",
+]
+
+_TIMELESS_INDICATORS = [
+    "always", "never", "rule", "principle", "convention", "workflow",
+    "must", "require", "mandatory", "standard", "non-negotiable",
+    "every time", "forever", "permanent",
+]
+
+
+def classify_temporal(content: str) -> str:
+    """Classify temporal relevance: timeless, stable, or ephemeral.
+
+    - timeless: content describes permanent rules, conventions, principles.
+        These decay 3x slower.
+    - ephemeral: content describes temporary, pending, or tentative state.
+        These decay 3x faster.
+    - stable: everything else. Normal decay rate.
+
+    Auto-detected from content keywords. Can be overridden by passing
+    temporal explicitly in metadata.
+    """
+    content_lower = content.lower() if content else ""
+    if any(p in content_lower for p in _EPHEMERAL_INDICATORS):
+        return "ephemeral"
+    if any(p in content_lower for p in _TIMELESS_INDICATORS):
+        return "timeless"
+    return "stable"
+
+
+# -- Semantic similarity (mechanism 12) -----------------------------------
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text: str) -> Set[str]:
+    """Tokenize text into a set of lowercase alphanumeric tokens."""
+    return set(_TOKEN_RE.findall(text.lower()))
+
+
+def jaccard_similarity(set_a: Set[str], set_b: Set[str]) -> float:
+    """Jaccard similarity between two sets: |A ∩ B| / |A ∪ B|."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = set_a & set_b
+    union = set_a | set_b
+    return len(intersection) / len(union)
+
+
+def semantic_similarity(content_a: str, content_b: str) -> float:
+    """Compute semantic similarity between two text strings.
+
+    Uses token-level Jaccard similarity. Fast, no external dependencies.
+    Returns 0-1, where 1 = identical and 0 = no overlap.
+    """
+    tokens_a = tokenize(content_a)
+    tokens_b = tokenize(content_b)
+    return jaccard_similarity(tokens_a, tokens_b)
+
+
+# -- Conflict detection (mechanism 13) -------------------------------------
+
+_NUMBER_RE = re.compile(r"\b\d+\.?\d*\b")
+
+_NEGATION_WORDS = {"not", "never", "no", "none", "without", "dont", "stop", "cancel"}
+
+
+def _extract_numbers(text: str) -> Set[str]:
+    """Extract all number-like tokens from text."""
+    return set(_NUMBER_RE.findall(text))
+
+
+def detect_conflict(old_content: str, new_content: str) -> bool:
+    """Detect if new_content contradicts old_content.
+
+    Heuristic: if the two contents share many keywords (similarity > 0.4)
+    BUT have different numbers OR different negation patterns, it's likely
+    a conflict (the new memory supersedes the old one).
+
+    Returns True if the new content likely supersedes the old.
+    """
+    tokens_old = tokenize(old_content)
+    tokens_new = tokenize(new_content)
+    similarity = jaccard_similarity(tokens_old, tokens_new)
+    if similarity < 0.4:
+        return False  # Not similar enough to conflict
+
+    # Check for different numbers
+    nums_old = _extract_numbers(old_content)
+    nums_new = _extract_numbers(new_content)
+    if nums_old and nums_new and nums_old != nums_new:
+        return True  # Numbers changed → likely an update
+
+    # Check for negation flip (old says "X", new says "not X" or vice versa)
+    neg_old = _NEGATION_WORDS & tokens_old
+    neg_new = _NEGATION_WORDS & tokens_new
+    if neg_old != neg_new:
+        return True  # Negation changed → likely a correction
+
+    return False
 
 
 def classify_origin(

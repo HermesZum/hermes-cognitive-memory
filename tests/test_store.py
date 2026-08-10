@@ -395,15 +395,15 @@ class TestReliabilityRanking:
     def test_reliable_source_ranks_higher(self, store):
         """A memory with higher reliability should rank higher than one with lower."""
         reliable_id = store.add(
-            "memory", "EURUSD correlation with DXY",
+            "memory", "EURUSD shows strong correlation with DXY index over 2 years",
             origin="research_finding", reliability=0.95,
         )
         unreliable_id = store.add(
-            "memory", "EURUSD correlation with DXY",
+            "memory", "GBPUSD might correlate with DXY but needs more study",
             origin="research_finding", reliability=0.3,
         )
 
-        results = store.search("EURUSD correlation")
+        results = store.search("DXY")
         assert len(results) >= 2
 
         # The reliable one should rank higher

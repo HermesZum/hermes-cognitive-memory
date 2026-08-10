@@ -13,6 +13,19 @@ relevant memories with decay-aware ranking before each turn.
 
 It also exposes its own LLM-facing tools (cognitive_search, cognitive_stats)
 for the agent to query and inspect the cognitive store.
+
+Triage mechanisms:
+- 8 neuroscience-inspired decay mechanisms (Ebbinghaus, reconsolidation, RIF, etc.)
+- Origin-based importance classification (user corrections > preferences > research > environment > inference)
+- Temporal relevance (timeless memories decay slower, ephemeral faster)
+- Semantic deduplication (near-duplicates merge instead of competing)
+- Conflict supersession (contradictory new memories supersede old ones)
+- Auto-pinning by access frequency (frequently accessed memories self-protect)
+- Access-count decay floor (proven-valuable memories survive longer)
+- Prune logging (deleted memories logged for audit before removal)
+- Reliability scoring (trustworthy sources rank higher in search)
+- Hard-to-find protection (difficult-to-rediscover info gets extra protection)
+- Manual pinning (critical info can be permanently protected)
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
-from .decay import DecayParams, classify_origin
+from .decay import DecayParams, classify_origin, classify_temporal
 from .store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -35,15 +48,16 @@ logger = logging.getLogger(__name__)
 # so hook execution is visible in agent.log for debugging.
 logger.setLevel(logging.INFO)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Tool schemas exposed to the LLM
 _SEARCH_SCHEMA = {
     "name": "cognitive_search",
     "description": (
         "Search the cognitive memory store with decay-aware ranking. "
-        "Returns memories ranked by relevance × importance × confidence, "
-        "with weak/old memories naturally fading out."
+        "Returns memories ranked by relevance × importance × confidence × reliability, "
+        "with weak/old memories naturally fading out. Superseded memories "
+        "(replaced by newer conflicting info) are excluded from results."
     ),
     "parameters": {
         "type": "object",
@@ -67,7 +81,8 @@ _STATS_SCHEMA = {
     "name": "cognitive_stats",
     "description": (
         "Get statistics about the cognitive memory store: total memories, "
-        "average importance, decay status, prunable count."
+        "average importance, decay status, prunable count, pinned count, "
+        "temporal distribution, superseded count."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
@@ -76,9 +91,10 @@ _REMEMBER_SCHEMA = {
     "name": "cognitive_remember",
     "description": (
         "Store an explicit fact to cognitive memory with importance, "
-        "origin, and reliability metadata. Use this for things the user "
+        "origin, reliability, and temporal metadata. Use this for things the user "
         "states as durable facts, research findings, or hard-to-find "
-        "information that should be preserved."
+        "information that should be preserved. Near-duplicates are automatically "
+        "merged; conflicting memories automatically supersede old ones."
     ),
     "parameters": {
         "type": "object",
@@ -124,7 +140,17 @@ _REMEMBER_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "True to permanently protect this memory from pruning. "
-                    "Use only for critical information that must never be lost."
+                    "Use only for critical information that must never be lost. "
+                    "Memories are also auto-pinned after 5+ accesses."
+                ),
+            },
+            "temporal": {
+                "type": "string",
+                "enum": ["timeless", "stable", "ephemeral"],
+                "description": (
+                    "Temporal relevance. timeless=slow decay (permanent rules), "
+                    "stable=normal decay (default), ephemeral=fast decay (temporary state). "
+                    "Auto-detected from content if not specified."
                 ),
             },
         },
@@ -167,6 +193,9 @@ def _build_params(config: Dict[str, Any]) -> DecayParams:
         reconsolidation_rate=config.get("reconsolidation_rate", 0.1),
         rif_penalty=config.get("rif_penalty", 0.05),
         confidence_decay_rate=config.get("confidence_decay_rate", 0.002),
+        auto_pin_threshold=config.get("auto_pin_threshold", 5),
+        dedup_similarity_threshold=config.get("dedup_similarity_threshold", 0.85),
+        conflict_similarity_threshold=config.get("conflict_similarity_threshold", 0.60),
     )
 
 
@@ -255,7 +284,8 @@ class CognitiveMemoryProvider(MemoryProvider):
         for mem, score in results:
             target_label = "USER PROFILE" if mem["target"] == "user" else "MEMORY"
             importance_bar = _importance_bar(mem["importance"])
-            lines.append(f"  {target_label} [{importance_bar}] (score={score:.3f}):")
+            temporal_tag = f" [{mem.get('temporal', 'stable')}]" if mem.get("temporal") and mem["temporal"] != "stable" else ""
+            lines.append(f"  {target_label} [{importance_bar}]{temporal_tag} (score={score:.3f}):")
             # Indent multi-line content
             for content_line in mem["content"].split("\n"):
                 lines.append(f"    {content_line}")
@@ -390,9 +420,6 @@ class CognitiveMemoryProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Extract insights before context compression."""
-        # No extraction needed — memories are already stored separately.
-        # The cognitive store is NOT part of the conversation context,
-        # so compression doesn't affect it.
         return ""
 
     def on_memory_write(
@@ -409,6 +436,7 @@ class CognitiveMemoryProvider(MemoryProvider):
         - reliability: 0-1 trust score (default 1.0)
         - hard_to_find: bool, extra decay protection
         - pinned: bool, never prune
+        - temporal: 'timeless'/'stable'/'ephemeral' (auto-detected if not specified)
         """
         if not self._store:
             return
@@ -423,6 +451,11 @@ class CognitiveMemoryProvider(MemoryProvider):
         hard_to_find = bool(meta.get("hard_to_find", False))
         pinned = bool(meta.get("pinned", False))
 
+        # Temporal classification — auto-detect if not specified
+        temporal = meta.get("temporal")
+        if temporal not in ("timeless", "stable", "ephemeral"):
+            temporal = classify_temporal(content)
+
         try:
             if action == "add":
                 mem_id = self._store.add(
@@ -433,11 +466,12 @@ class CognitiveMemoryProvider(MemoryProvider):
                     reliability=reliability,
                     hard_to_find=hard_to_find,
                     pinned=pinned,
+                    temporal=temporal,
                 )
                 logger.debug(
                     "cognitive-memory: mirrored add (id=%s, origin=%s, "
-                    "reliability=%.2f, pinned=%s)",
-                    mem_id, origin, reliability, pinned,
+                    "reliability=%.2f, pinned=%s, temporal=%s)",
+                    mem_id, origin, reliability, pinned, temporal,
                 )
             elif action == "replace":
                 self._store.add(
@@ -448,10 +482,9 @@ class CognitiveMemoryProvider(MemoryProvider):
                     reliability=reliability,
                     hard_to_find=hard_to_find,
                     pinned=pinned,
+                    temporal=temporal,
                 )
-                logger.debug(
-                    "cognitive-memory: mirrored replace as new add (origin=%s)", origin
-                )
+                logger.debug("cognitive-memory: mirrored replace as new add (origin=%s, temporal=%s)", origin, temporal)
             elif action == "remove":
                 count = self._store.remove_by_content(content[:80])
                 logger.debug("cognitive-memory: mirrored remove (matched %d)", count)
@@ -494,6 +527,15 @@ class CognitiveMemoryProvider(MemoryProvider):
                 "maximum": 50,
                 "required": False,
             },
+            {
+                "key": "auto_pin_threshold",
+                "description": "Access count at which a memory is auto-pinned",
+                "type": "integer",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 100,
+                "required": False,
+            },
         ]
 
     def backup_paths(self) -> List[str]:
@@ -528,6 +570,8 @@ class CognitiveMemoryProvider(MemoryProvider):
                     "origin": mem["origin"],
                     "pinned": bool(mem.get("pinned", 0)),
                     "hard_to_find": bool(mem.get("hard_to_find", 0)),
+                    "temporal": mem.get("temporal", "stable"),
+                    "superseded": bool(mem.get("superseded", 0)),
                     "relevance_score": round(score, 4),
                 }
                 for mem, score in results
@@ -540,8 +584,9 @@ class CognitiveMemoryProvider(MemoryProvider):
         mem_count = self._store.count("memory")
         user_count = self._store.count("user")
         total_chars = self._store.total_chars()
+        superseded_count = self._store.count(include_superseded=True) - total
 
-        # Get all memories for stats
+        # Get all active memories for stats
         all_mems = self._store.get_all()
         avg_importance = (
             sum(m["importance"] for m in all_mems) / len(all_mems)
@@ -554,19 +599,45 @@ class CognitiveMemoryProvider(MemoryProvider):
         pinned_count = sum(1 for m in all_mems if m.get("pinned", 0))
         hard_to_find_count = sum(1 for m in all_mems if m.get("hard_to_find", 0))
 
+        # Temporal distribution
+        temporal_dist = {}
+        for m in all_mems:
+            t = m.get("temporal", "stable")
+            temporal_dist[t] = temporal_dist.get(t, 0) + 1
+
+        # Origin distribution
+        origin_dist = {}
+        for m in all_mems:
+            o = m.get("origin", "unknown")
+            origin_dist[o] = origin_dist.get(o, 0) + 1
+
         # Top 5 by importance
         top_5 = sorted(all_mems, key=lambda m: m["importance"], reverse=True)[:5]
+
+        # Prune log info
+        prune_log_path = Path(self._store._prune_log_path)
+        prune_log_exists = prune_log_path.exists()
+        prune_log_size = prune_log_path.stat().st_size if prune_log_exists else 0
 
         output = {
             "total_memories": total,
             "memory_store": mem_count,
             "user_profile": user_count,
+            "superseded": superseded_count,
             "total_chars": total_chars,
             "avg_importance": round(avg_importance, 3),
             "prunable_count": prunable,
             "pinned_count": pinned_count,
             "hard_to_find_count": hard_to_find_count,
             "decay_floor": self._params.decay_floor,
+            "auto_pin_threshold": self._params.auto_pin_threshold,
+            "temporal_distribution": temporal_dist,
+            "origin_distribution": origin_dist,
+            "prune_log": {
+                "exists": prune_log_exists,
+                "path": str(prune_log_path),
+                "size_bytes": prune_log_size,
+            },
             "top_memories": [
                 {
                     "content": m["content"][:100],
@@ -576,6 +647,7 @@ class CognitiveMemoryProvider(MemoryProvider):
                     "reliability": m.get("reliability", 1.0),
                     "pinned": bool(m.get("pinned", 0)),
                     "hard_to_find": bool(m.get("hard_to_find", 0)),
+                    "temporal": m.get("temporal", "stable"),
                 }
                 for m in top_5
             ],
@@ -590,6 +662,7 @@ class CognitiveMemoryProvider(MemoryProvider):
         reliability = args.get("reliability", 1.0)
         hard_to_find = args.get("hard_to_find", False)
         pinned = args.get("pinned", False)
+        temporal = args.get("temporal")
 
         # Validate enum values
         if target not in ("memory", "user"):
@@ -600,6 +673,10 @@ class CognitiveMemoryProvider(MemoryProvider):
         )
         if origin not in valid_origins:
             origin = "agent_inference"
+
+        # Validate temporal
+        if temporal not in ("timeless", "stable", "ephemeral"):
+            temporal = classify_temporal(content)
 
         # Clamp reliability to [0, 1]
         reliability = max(0.0, min(1.0, float(reliability)))
@@ -612,6 +689,7 @@ class CognitiveMemoryProvider(MemoryProvider):
             reliability=reliability,
             hard_to_find=bool(hard_to_find),
             pinned=bool(pinned),
+            temporal=temporal,
         )
         return json.dumps({
             "status": "stored",
@@ -620,6 +698,7 @@ class CognitiveMemoryProvider(MemoryProvider):
             "reliability": reliability,
             "hard_to_find": bool(hard_to_find),
             "pinned": bool(pinned),
+            "temporal": temporal,
         })
 
     def _handle_forget(self, args: Dict[str, Any]) -> str:
