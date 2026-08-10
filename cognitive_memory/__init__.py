@@ -442,7 +442,9 @@ class CognitiveMemoryProvider(MemoryProvider):
     def _handle_search(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
         target = args.get("target")
-        limit = min(args.get("limit", 10), 30)
+        limit = args.get("limit", 10)
+        # Clamp limit to valid range — no negatives allowed
+        limit = max(1, min(int(limit), 30))
 
         results = self._store.search(query, target=target, limit=limit)
         output = {
@@ -506,6 +508,13 @@ class CognitiveMemoryProvider(MemoryProvider):
         origin = args.get("origin", "agent_inference")
         tags = args.get("tags", [])
 
+        # Validate enum values
+        if target not in ("memory", "user"):
+            target = "memory"
+        valid_origins = ("user_correction", "user_preference", "environment_fact", "agent_inference")
+        if origin not in valid_origins:
+            origin = "agent_inference"
+
         mem_id = self._store.add(
             target=target,
             content=content,
@@ -526,7 +535,8 @@ class CognitiveMemoryProvider(MemoryProvider):
 
 def _importance_bar(importance: float) -> str:
     """Render a 10-char importance bar like ▓▓▓░░░░░░░."""
-    filled = int(importance * 10)
+    clamped = max(0.0, min(1.0, importance))
+    filled = int(clamped * 10)
     return "▓" * filled + "░" * (10 - filled)
 
 

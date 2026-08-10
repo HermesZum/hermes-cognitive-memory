@@ -146,7 +146,7 @@ def apply_access_reinforcement(
     behind 'spaced repetition' — memories that are recalled periodically
     stay strong.
     """
-    return min(1.0, importance + params.access_boost)
+    return max(0.0, min(1.0, importance + params.access_boost))
 
 
 def apply_reconsolidation(
@@ -164,8 +164,8 @@ def apply_reconsolidation(
         boost = reconsolidation_rate * (1 - importance)
         new_importance = importance + boost
     """
-    boost = params.reconsolidation_rate * (1.0 - importance)
-    return min(1.0, importance + boost)
+    boost = params.reconsolidation_rate * (1.0 - max(0.0, importance))
+    return max(0.0, min(1.0, importance + boost))
 
 
 def apply_rif_penalty(
@@ -180,39 +180,6 @@ def apply_rif_penalty(
     suppresses competing traces.
     """
     return max(0.0, importance - params.rif_penalty)
-
-
-def relevance_score(
-    fts_rank: float,
-    importance: float,
-    confidence: float,
-    now: float,
-    last_access: float,
-    params: DecayParams,
-) -> float:
-    """Compute the final relevance score for a memory.
-
-    This combines all factors:
-        score = fts_rank * decayed_importance * decayed_confidence
-
-    fts_rank comes from SQLite FTS5 (0.0 to ~2.0, higher = better match).
-    We normalize it roughly by dividing by 2 and clamping.
-
-    The decayed importance and confidence are computed on-the-fly so the
-    score reflects the current cognitive state, not the stored value.
-    """
-    # Normalize FTS rank (bm25 can be negative; we use rank from MATCH
-    # which gives higher = better in our custom function)
-    normalized_fts = max(0.0, min(1.0, fts_rank / 2.0))
-
-    decayed_importance = apply_decay(importance, last_access, now, params)
-    # Confidence uses created_at, not last_access — trust erodes from
-    # when the memory was formed, not from last access.
-    # We don't have created_at here, so approximate with last_access.
-    # The store layer passes both separately.
-    decayed_confidence = confidence  # Apply confidence decay in store layer
-
-    return normalized_fts * decayed_importance * decayed_confidence
 
 
 def should_prune(importance: float, params: DecayParams) -> bool:

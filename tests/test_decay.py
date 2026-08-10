@@ -13,7 +13,6 @@ from cognitive_memory.decay import (
     classify_origin,
     initial_confidence,
     initial_importance,
-    relevance_score,
     should_prune,
 )
 
