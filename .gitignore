@@ -16,6 +16,9 @@ htmlcov/
 *.db-shm
 *.db-wal
 
+# Personal memory dumps (NEVER commit — contain real user data)
+compaction/
+
 # IDE
 .vscode/
 .idea/

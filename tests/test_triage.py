@@ -190,7 +190,7 @@ class TestSemanticDeduplication:
         """Completely different content should not merge."""
         id1 = store.add("memory", "EURUSD trading strategy with breakout entries",
                         origin="research_finding")
-        id2 = store.add("memory", "WhatsApp configuration on port 19001",
+        id2 = store.add("memory", "Messaging app configuration on port 1234",
                         origin="environment_fact")
 
         assert id1 != id2
@@ -257,7 +257,7 @@ class TestConflictSupersession:
                         "Risk cap is 1.5 percent per trade for FX demo",
                         origin="user_preference")
         id2 = store.add("memory",
-                        "WhatsApp is configured on port 19001 for OpenClaw",
+                        "Messaging app is configured on port 1234 for the gateway",
                         origin="environment_fact")
 
         mem1 = store.get(id1)
@@ -396,7 +396,7 @@ class TestSemanticSimilarity:
     def test_no_conflict_different_topics(self):
         assert detect_conflict(
             "Risk cap is 1.5 percent",
-            "WhatsApp on port 19001"
+            "Messaging app on port 1234"
         ) == False
 
     def test_tokenize(self):

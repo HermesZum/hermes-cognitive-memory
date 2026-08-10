@@ -75,7 +75,7 @@ def test_find_mirror_matches(store, sync, home):
 
 
 def test_find_mirror_no_match(store, sync):
-    store.add("memory", "WhatsApp allowlist +000", origin="environment_fact")
+    store.add("memory", "Messaging app allowlist +1", origin="environment_fact")
     mirror, sim = sync._find_mirror("memory", "The weather in Lisbon is sunny")
     assert mirror is None
 
@@ -131,12 +131,12 @@ def test_plan_remove_strong_mirror(store, sync, home):
     """Strong mirror (importance >= keep) -> safe to remove built-in copy."""
     store.add(
         "memory",
-        "hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui upstream nesquena hermes-webui nginx subdomain hermes.lan.local Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui",
+        "widget-app :1234 systemd fork github.com/acme/widget-app upstream acme-org widget-app nginx subdomain app.acme.internal Port 9999 chat only Memory Cognitive panels exist only in widget-app",
         origin="environment_fact", importance=0.95,
     )
     _write_memory(
         home, "memory",
-        ["hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui upstream nesquena hermes-webui nginx subdomain hermes.lan.local Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui"],
+        ["widget-app :1234 systemd fork github.com/acme/widget-app upstream acme-org widget-app nginx subdomain app.acme.internal Port 9999 chat only Memory Cognitive panels exist only in widget-app"],
     )
     plan = sync.build_plan("memory", 2200)
     assert len(plan.removes) == 1
@@ -171,7 +171,7 @@ def test_plan_keep_decaying_mirror(store, sync, home):
 def test_plan_keep_critical_origin(store, sync, home):
     """user_correction/user_preference entries NEVER leave the built-in file."""
     content = (
-        "FX project (Trader): demo-first. Trade demo until a strategy "
+        "Trading project (Alpha): demo-first. Trade demo until a strategy "
         "graduates with twenty journaled trades and positive expectancy then "
         "scale into real money slowly never rush no strategy hopping"
     )
@@ -185,9 +185,9 @@ def test_plan_keep_critical_origin(store, sync, home):
 def test_plan_remove_noncritical_strong(store, sync, home):
     """Environment facts with strong mirrors may be trimmed (detail in store)."""
     content = (
-        "hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui "
-        "upstream nesquena hermes-webui nginx subdomain hermes.lan.local "
-        "Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui"
+        "widget-app :1234 systemd fork github.com/acme/widget-app "
+        "upstream acme-org widget-app nginx subdomain app.acme.internal "
+        "Port 9999 chat only Memory Cognitive panels exist only in widget-app"
     )
     store.add("memory", content, origin="environment_fact", importance=0.95)
     _write_memory(home, "memory", [content])
@@ -210,9 +210,9 @@ def test_apply_dry_run_writes_nothing(sync, home):
 
 def test_apply_removes_and_compacts(store, sync, home):
     strong = (
-        "hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui "
-        "upstream nesquena hermes-webui nginx subdomain hermes.lan.local "
-        "Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui"
+        "widget-app :1234 systemd fork github.com/acme/widget-app "
+        "upstream acme-org widget-app nginx subdomain app.acme.internal "
+        "Port 9999 chat only Memory Cognitive panels exist only in widget-app"
     )
     medium = (
         "The pipeline consists of a morning briefing before the session starts "
@@ -241,7 +241,7 @@ def test_apply_removes_and_compacts(store, sync, home):
     remaining = (home / "memories" / "MEMORY.md").read_text(encoding="utf-8")
     assert "Keep me, no mirror" in remaining
     assert "full detail in cognitive memory" in remaining
-    assert "hermes-webui :8780 systemd" not in remaining
+    assert "widget-app :1234 systemd" not in remaining
 
 
 def test_apply_empty_plan(sync, home):
@@ -318,9 +318,9 @@ def test_apply_pins_removed_mirror(store, sync, home):
     """When a built-in copy is removed, its mirror is pinned so the store copy
     is permanent — closing the decay-to-prune data-loss window."""
     content = (
-        "hermes-webui :8780 systemd fork github.com/MyOrg/hermes-webui "
-        "upstream nesquena hermes-webui nginx subdomain hermes.lan.local "
-        "Open WebUI 8082 chat only Memory Cognitive panels exist only in hermes-webui"
+        "widget-app :1234 systemd fork github.com/acme/widget-app "
+        "upstream acme-org widget-app nginx subdomain app.acme.internal "
+        "Port 9999 chat only Memory Cognitive panels exist only in widget-app"
     )
     mem_id = store.add("memory", content, origin="environment_fact", importance=0.95)
     _write_memory(home, "memory", [content])

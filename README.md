@@ -239,7 +239,7 @@ confidence, and decay floor:
 | `user_correction` | 0.95 | 1.00 | 0.02 | "Never pkill -f hermes" |
 | `user_preference` | 0.85 | 0.90 | 0.03 | "Prefers step-by-step plans in chat" |
 | `research_finding` | 0.80 | 0.85 | 0.03 | "EURUSD 0.85 corr with DXY, backtested 2y" |
-| `environment_fact` | 0.60 | 0.70 | 0.05 | "SSH user is vm_user" |
+| `environment_fact` | 0.60 | 0.70 | 0.05 | "VPN host is vpn.example.com" |
 | `agent_inference` | 0.35 | 0.40 | 0.05 | "Model fallback chain behavior" |
 
 Classification is keyword-based in `decay.py:classify_origin()`. It checks
