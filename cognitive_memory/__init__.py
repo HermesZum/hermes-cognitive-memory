@@ -248,7 +248,12 @@ class CognitiveMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Apply global decay after each turn."""
+        """Apply global decay after each turn (backup for on_turn_start).
+
+        In CLI mode, the background worker completes reliably and this
+        provides a second decay pass. In API mode, on_turn_start handles
+        it inline since this background task may not complete.
+        """
         if not self._store:
             return
         # Skip for non-primary contexts (cron, subagent)
@@ -303,8 +308,26 @@ class CognitiveMemoryProvider(MemoryProvider):
     # -- Optional hooks -----------------------------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Per-turn tick — no action needed (decay applied in sync_turn)."""
-        pass
+        """Per-turn tick — apply global decay inline.
+
+        We apply decay here (inline) instead of in sync_turn (backgrounded)
+        because in API/gateway mode the background worker may not complete
+        before the provider instance is garbage-collected. on_turn_start
+        runs inline on the request thread, so it always executes.
+        """
+        if not self._store:
+            return
+        # Skip for non-primary contexts (cron, subagent)
+        if self._agent_context not in ("primary", ""):
+            return
+        try:
+            prunable = self._store.apply_global_decay()
+            if prunable > 0:
+                logger.debug(
+                    "cognitive-memory: %d memories are prunable", prunable
+                )
+        except Exception:
+            logger.debug("cognitive-memory: on_turn_start decay failed", exc_info=True)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """End-of-session: apply final decay and prune."""
