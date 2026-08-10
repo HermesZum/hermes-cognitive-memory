@@ -1,0 +1,9 @@
+name: cognitive
+version: 0.1.0
+description: "Cognitive memory — neuroscience-inspired decay, reconsolidation, retrieval-induced forgetting, and source-confidence erosion for Hermes Agent."
+pip_dependencies: []
+requires_env: []
+hooks:
+  - on_session_end
+  - on_memory_write
+  - on_turn_start
