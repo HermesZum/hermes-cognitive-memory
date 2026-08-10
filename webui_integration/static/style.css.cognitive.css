@@ -1,0 +1,26 @@
+/* ── Cognitive memory panel (hermes-cognitive-memory plugin) ── */
+.cognitive-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.cognitive-controls input[type="search"]{flex:1;min-width:180px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)}
+.cognitive-controls select{padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)}
+.cognitive-stats{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.cognitive-chip{display:inline-flex;align-items:baseline;gap:4px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted);background:var(--bg)}
+.cognitive-chip strong{font-size:13px;color:var(--text)}
+.cognitive-card{border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px;background:var(--bg)}
+.cognitive-card-pinned{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-bg, rgba(184,134,11,0.12))}
+.cognitive-card-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:6px}
+.cognitive-meta{font-size:11px;color:var(--muted);margin-left:auto}
+.cognitive-actions{display:inline-flex;gap:6px}
+.cognitive-btn{padding:3px 10px;font-size:12px}
+.cognitive-btn-danger{color:var(--error);border-color:var(--error)}
+.cognitive-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden;margin-bottom:8px}
+.cognitive-bar span{display:block;height:100%;background:var(--accent);transition:width .2s}
+.cognitive-content{font-size:13px;white-space:pre-wrap;word-break:break-word}
+.cognitive-badge{font-size:10px;font-weight:600;letter-spacing:.04em;padding:2px 7px;border-radius:999px;text-transform:uppercase}
+.cognitive-badge-pinned{background:var(--accent-bg, rgba(184,134,11,0.12));color:var(--accent)}
+.cognitive-badge-hard{background:rgba(128,128,128,.15);color:var(--muted)}
+.cognitive-add-form{border:1px dashed var(--border);border-radius:8px;padding:12px;margin-bottom:12px;background:var(--bg)}
+.cognitive-add-row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:8px 0}
+.cognitive-add-row label{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted)}
+.cognitive-prune-log{margin-top:14px;font-size:12px}
+.cognitive-prune-log summary{cursor:pointer;color:var(--muted)}
+.cognitive-prune-log pre{max-height:220px;overflow:auto;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--code-bg);font-size:11px;white-space:pre-wrap;word-break:break-word}

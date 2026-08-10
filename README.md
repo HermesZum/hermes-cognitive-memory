@@ -296,6 +296,31 @@ You can use both systems together. The built-in memory gives you simple,
 durable, human-readable entries. The cognitive layer adds decay, ranking,
 and auto-pruning on top.
 
+## WebUI management panel
+
+If you run [hermes-webui](https://github.com/nesquena/hermes-webui), the
+Memory panel gains a **Cognitive Memory** section: browse all memories with
+their cognitive metadata (origin, importance, reliability, temporal class,
+access count), filter/search them, **pin / unpin / delete**, add new
+memories, and inspect the prune log.
+
+This is an optional integration — it only reads/writes the same SQLite store
+the plugin uses, and never imports Hermes Agent code into the WebUI process.
+
+Install (copy one bridge module + 2 dispatcher lines + JS/CSS blocks):
+
+```bash
+cd /root/hermes-webui
+cp ../hermes-cognitive-memory/webui_integration/api/cognitive_bridge.py api/
+# …then apply the 3 small patches documented in:
+# webui_integration/INSTALL.md
+sudo systemctl restart hermes-webui
+```
+
+Full instructions, the exact patch locations, the API contract, and design
+notes are in [`webui_integration/INSTALL.md`](webui_integration/INSTALL.md).
+The reference files live under `webui_integration/static/`.
+
 ## Troubleshooting
 
 ### DB not created after install

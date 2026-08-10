@@ -450,3 +450,46 @@ class TestResearchFindingProtection:
         assert pruned == 1
         assert store.get(research_id) is not None
         assert store.get(inference_id) is None
+
+
+class TestSetPinned:
+    """Manual pin/unpin override (WebUI management surface)."""
+
+    def test_set_pinned_marks_memory(self, store):
+        mem_id = store.add("memory", "pin me", origin="agent_inference")
+        assert store.get(mem_id)["pinned"] == 0
+
+        assert store.set_pinned(mem_id, True) is True
+        assert store.get(mem_id)["pinned"] == 1
+
+        assert store.set_pinned(mem_id, False) is True
+        assert store.get(mem_id)["pinned"] == 0
+
+    def test_set_pinned_missing_id_returns_false(self, store):
+        assert store.set_pinned("no-such-id", True) is False
+
+    def test_set_pinned_protects_from_prune(self, store):
+        mem_id = store.add("memory", "pin-protected", origin="agent_inference")
+        store.set_pinned(mem_id, True)
+        # Force near-zero importance + ancient last_access
+        store._conn.execute(
+            "UPDATE memories SET importance = 0.001, last_access = 0 WHERE id = ?",
+            (mem_id,),
+        )
+        store._conn.commit()
+
+        assert store.prune() == 0
+        assert store.get(mem_id) is not None
+
+    def test_unpinned_then_prunable_again(self, store):
+        mem_id = store.add("memory", "unpin me", origin="agent_inference")
+        store.set_pinned(mem_id, True)
+        store.set_pinned(mem_id, False)
+        store._conn.execute(
+            "UPDATE memories SET importance = 0.001, last_access = 0 WHERE id = ?",
+            (mem_id,),
+        )
+        store._conn.commit()
+
+        assert store.prune() == 1
+        assert store.get(mem_id) is None

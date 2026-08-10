@@ -397,6 +397,23 @@ class MemoryStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def set_pinned(self, mem_id: str, pinned: bool) -> bool:
+        """Set the pinned flag on a memory (manual override from the WebUI).
+
+        Returns True if the memory exists and was updated. Pinned memories
+        are never pruned regardless of decay. Unpinning via this method is
+        a manual override — auto-pinning on access may re-pin it later if
+        the memory keeps being retrieved.
+        """
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.execute(
+                "UPDATE memories SET pinned = ? WHERE id = ?",
+                (int(bool(pinned)), mem_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def remove_by_content(self, content_substring: str) -> int:
         """Remove memories whose content contains the substring. Returns count.
 
