@@ -648,6 +648,8 @@ class MemoryStore:
 
         scored = []
         for row in rows:
+            fts_score = 0.0
+            normalized_fts = 0.5
             temporal = row.get("temporal", "stable")
             decayed_importance = apply_decay(
                 row["importance"], row["last_access"], now, self._params, temporal
@@ -656,8 +658,34 @@ class MemoryStore:
                 row["confidence"], row["last_access"], now, self._params
             )
             reliability = row.get("reliability", 1.0)
-            score = decayed_importance * decayed_confidence * reliability
+            hard_to_find = 2.0 if row.get("hard_to_find") else 1.0
+            temporal_boost = 1.5 if temporal == "timeless" else 1.0
+            recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
+            score = (
+                normalized_fts
+                * decayed_importance
+                * decayed_confidence
+                * reliability
+                * hard_to_find
+                * temporal_boost
+                * recency_boost
+            )
             scored.append((row, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Always-inject pinned memories in LIKE fallback as well.
+        result_ids = {row["id"] for row, _ in scored}
+        pinned_sql = "SELECT * FROM memories WHERE pinned = 1 AND superseded = 0"
+        pinned_params: list = []
+        if target:
+            pinned_sql += " AND target = ?"
+            pinned_params.append(target)
+        pinned_rows = [dict(r) for r in self._conn.execute(pinned_sql, pinned_params).fetchall()]
+        for row in pinned_rows:
+            if row["id"] not in result_ids:
+                top_score = scored[0][1] if scored else 1.0
+                scored.append((row, top_score * 2.0))
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
