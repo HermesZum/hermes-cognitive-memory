@@ -579,7 +579,20 @@ class MemoryStore:
                 )
                 reliability = row.get("reliability", 1.0)
 
-                score = normalized_fts * decayed_importance * decayed_confidence * reliability
+                # Multipliers for protected/timeless/recency signals
+                hard_to_find = 2.0 if row.get("hard_to_find") else 1.0
+                temporal_boost = 1.5 if temporal == "timeless" else 1.0
+                recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
+
+                score = (
+                    normalized_fts
+                    * decayed_importance
+                    * decayed_confidence
+                    * reliability
+                    * hard_to_find
+                    * temporal_boost
+                    * recency_boost
+                )
                 scored.append((row, score))
 
             scored.sort(key=lambda x: x[1], reverse=True)
