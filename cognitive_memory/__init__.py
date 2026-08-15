@@ -288,17 +288,16 @@ class CognitiveMemoryProvider(MemoryProvider):
         logger.info("cognitive-memory: initialized (db=%s)", db_path)
 
     def system_prompt_block(self) -> str:
-        """Static text for the system prompt."""
-        if not self._store:
-            return ""
-        count = self._store.count()
-        return (
-            f"\n[Cognitive Memory Active — {count} memories, "
-            f"decay-aware retrieval enabled]\n"
-        )
+        """System prompt metadata block disabled to avoid duplication."""
+        return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Retrieve relevant memories with cognitive ranking."""
+        """Retrieve relevant memories with cognitive ranking.
+
+        Returns a formatted context block with top matches. The host may run
+        this in a worker thread with a bounded timeout; keep it fast and
+        side-effect free.
+        """
         if not self._store or not self._params:
             return ""
         if not query.strip():
@@ -306,6 +305,7 @@ class CognitiveMemoryProvider(MemoryProvider):
 
         # Don't prefetch on trivial prompts
         from agent.memory_provider import is_trivial_prompt
+
         if is_trivial_prompt(query):
             return ""
 
@@ -434,6 +434,12 @@ class CognitiveMemoryProvider(MemoryProvider):
             logger.info("cognitive-memory: on_turn_start OK (decay applied, prunable=%d)", prunable)
         except Exception as e:
             logger.error("cognitive-memory: on_turn_start decay FAILED: %s", e, exc_info=True)
+
+        # Render minimal safety stubs for the built-in memory files.
+        # These files are NOT injected into agent context because
+        # memory_enabled=false / user_profile_enabled=false, but they exist
+        # as a safety fallback if prefetch or config changes later.
+        self._render_memory_stubs()
 
         # Propose (never auto-apply) compaction when built-in memory is full
         self._check_builtin_sync()
@@ -809,6 +815,40 @@ class CognitiveMemoryProvider(MemoryProvider):
         return BuiltinMemorySync(
             Path(hermes_home), self._store, self._params, config,
         )
+
+    def _render_memory_stubs(self) -> None:
+        """Write minimal safety stubs for built-in memory files.
+
+        These files are not injected into agent context because
+        memory_enabled=false / user_profile_enabled=false, but they serve
+        as a fallback if prefetch or config changes later.
+        """
+        if not self._store or not self._hermes_home:
+            return
+        try:
+            mem_path = Path(self._hermes_home) / "memories" / "MEMORY.md"
+            user_path = Path(self._hermes_home) / "memories" / "USER.md"
+            mem_count = self._store.count(target="memory")
+            user_count = self._store.count(target="user")
+            mem_path.write_text(
+                "# Agent Memory\n"
+                "Managed via cognitive DB. See WebUI for full state.\n"
+                f"DB entries: {mem_count}\n",
+                encoding="utf-8",
+            )
+            user_path.write_text(
+                "# User Profile\n"
+                "Managed via cognitive DB. See WebUI for full state.\n"
+                f"DB entries: {user_count}\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                "cognitive-memory: rendered memory stubs (memory=%d, user=%d)",
+                mem_count,
+                user_count,
+            )
+        except Exception as e:
+            logger.error("cognitive-memory: stub render FAILED: %s", e, exc_info=True)
 
     def _check_builtin_sync(self) -> None:
         """Propose (never auto-apply) compaction when built-in memory is full.
