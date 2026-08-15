@@ -123,6 +123,23 @@ memory:
       agent_inference: 0.4
 ```
 
+## Disabling built-in markdown injection
+
+When using the cognitive plugin as the primary memory layer, you should
+disable Hermes core's built-in markdown injection to avoid duplication.
+
+Add these flags under `memory:` in `config.yaml`:
+
+```yaml
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+```
+
+This prevents `MEMORY.md` and `USER.md` from being injected into every
+system prompt. The cognitive plugin will still render minimal stubs to
+those files for safety, but they are not used for context.
+
 ## How it works
 
 ### Architecture
