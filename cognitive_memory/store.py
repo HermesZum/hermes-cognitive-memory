@@ -584,6 +584,23 @@ class MemoryStore:
 
             scored.sort(key=lambda x: x[1], reverse=True)
 
+            # Always-inject pinned memories: append any pinned entries not
+            # already in the result set, with a 2x score boost. This ensures
+            # safety-critical rules are available regardless of query match.
+            result_ids = {row["id"] for row, _ in scored}
+            pinned_sql = "SELECT * FROM memories WHERE pinned = 1 AND superseded = 0"
+            pinned_params: list = []
+            if target:
+                pinned_sql += " AND target = ?"
+                pinned_params.append(target)
+            pinned_rows = [dict(r) for r in self._conn.execute(pinned_sql, pinned_params).fetchall()]
+            for row in pinned_rows:
+                if row["id"] not in result_ids:
+                    top_score = scored[0][1] if scored else 1.0
+                    scored.append((row, top_score * 2.0))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+
             # Apply access reinforcement + RIF + auto-pin to top results
             if scored:
                 self._apply_retrieval_effects_locked(

@@ -235,6 +235,8 @@ def _build_params(config: Dict[str, Any]) -> DecayParams:
 class CognitiveMemoryProvider(MemoryProvider):
     """Hermes memory provider with neuroscience-inspired cognitive decay."""
 
+    prefetch_inline = True
+
     def __init__(self):
         self._store: Optional[MemoryStore] = None
         self._params: Optional[DecayParams] = None
