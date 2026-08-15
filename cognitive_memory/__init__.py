@@ -245,6 +245,7 @@ class CognitiveMemoryProvider(MemoryProvider):
         self._agent_context: str = "primary"
         self._initialized = False
         self._last_prefetch_query: str = ""
+        self._prefetch_failed: bool = False
 
     # -- MemoryProvider interface -------------------------------------------
 
@@ -293,6 +294,12 @@ class CognitiveMemoryProvider(MemoryProvider):
         """System prompt metadata block disabled to avoid duplication."""
         return ""
 
+    def recall_status(self):
+        if self._prefetch_failed:
+            from agent.memory_provider import RecallStatus
+            return RecallStatus(provider_label="Cognitive Memory", count=0, glyph="⚠️")
+        return None
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Retrieve relevant memories with cognitive ranking.
 
@@ -313,10 +320,12 @@ class CognitiveMemoryProvider(MemoryProvider):
 
         self._last_prefetch_query = query
 
+        self._prefetch_failed = False
         try:
             results = self._store.search(query, limit=self._params.max_context)
             logger.info("cognitive-memory: prefetch OK (query=%r, results=%d)", query[:50], len(results))
         except Exception as e:
+            self._prefetch_failed = True
             logger.error("cognitive-memory: prefetch search FAILED: %s", e, exc_info=True)
             return ""
 
