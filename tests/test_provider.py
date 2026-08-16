@@ -53,11 +53,12 @@ class TestProviderBasics:
 
 
 class TestSystemPrompt:
-    def test_returns_block_with_count(self, provider):
+    def test_system_prompt_block_disabled(self, provider):
+        """system_prompt_block() returns '' — markdown injection is disabled
+        (the agent gets memories via inline prefetch, not the system prompt)."""
         provider._store.add("memory", "test entry")
         block = provider.system_prompt_block()
-        assert "Cognitive Memory Active" in block
-        assert "1 memories" in block
+        assert block == ""
 
 
 class TestPrefetch:
@@ -76,8 +77,9 @@ class TestPrefetch:
     def test_returns_formatted_context(self, provider):
         provider._store.add("memory", "User prefers Python", origin="user_preference")
         result = provider.prefetch("Python")
-        assert "memory-context" in result
+        # Plugin returns the raw recalled text (the core wraps it in <memory-context>).
         assert "User prefers Python" in result
+        assert "MEMORY" in result
 
     def test_includes_importance_bar(self, provider):
         provider._store.add("memory", "important fact", origin="user_correction")

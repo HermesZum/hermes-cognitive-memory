@@ -585,24 +585,27 @@ class MemoryStore:
         for t in terms:
             df = _term_doc_freq(self._conn, t)
             df = max(1, df)  # avoid div-by-zero / log(0)
-            idf[t] = math.log((total - df + 0.5) / (df + 0.5)) + 1.0
+            ratio = (total - df + 0.5) / (df + 0.5)
+            idf[t] = 1.0 + math.log1p(ratio)
         return idf
 
-    def _idf_boost_for_row(self, row: Dict[str, Any], idf: Dict[str, float]) -> float:
-        """Return an IDF boost multiplier for a memory row.
+    def _idf_boost_for_row(self, row: Dict[str, Any], idf: Dict[str, float]) -> Tuple[float, bool]:
+        """Return (IDF boost multiplier, matched_any_term) for a memory row.
 
         If the memory's content matches any query term, the boost is the max
-        idf among matched terms (rarer matched term → higher boost). If no
-        query term matches, boost = 1.0 (no penalty — FTS already matched it).
+        idf among matched terms (rarer matched term → higher boost); matched
+        is True. If no query term matches, boost = 1.0 and matched = False
+        (no penalty — FTS already matched it, but it may be a non-semantic
+        overlap, so the caller can apply the relevance floor).
         """
         if not idf:
-            return 1.0
+            return 1.0, False
         content = (row.get("content") or "").lower()
-        matched = [v for t, v in idf.items() if t in content]
-        if not matched:
-            return 1.0
+        matched_vals = [v for t, v in idf.items() if t in content]
+        if not matched_vals:
+            return 1.0, False
         # Max IDF among matched terms — rewards matching the rarest term
-        return max(matched)
+        return max(matched_vals), True
 
     def search(
         self,
@@ -699,14 +702,17 @@ class MemoryStore:
                 recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
 
                 # IDF term-match boost: memories matching rarer query terms rank higher
-                idf_boost = self._idf_boost_for_row(row, idf)
+                idf_boost, matched_term = self._idf_boost_for_row(row, idf)
 
                 # Relevance floor: drop results that neither matched a query term
-                # (idf_boost == 1.0) nor have meaningful FTS relevance. This
+                # (matched_term == False) nor have meaningful FTS relevance. This
                 # prevents pure high-importance memories from flooding the
                 # selective budget when the query has no real semantic match
                 # (they still surface via the critical tier if safety-relevant).
-                if idf_boost <= 1.0 and normalized_fts < 0.3:
+                # NOTE: a matched term with idf≈1.0 (common term in a small
+                # corpus) must NOT be treated as "no match" — matched_term is the
+                # authoritative signal, not the idf value.
+                if not matched_term and normalized_fts < 0.3:
                     continue
 
                 score = (
@@ -720,6 +726,8 @@ class MemoryStore:
                     * idf_boost
                 )
                 scored.append((row, score))
+
+
 
             scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -802,9 +810,9 @@ class MemoryStore:
             temporal_boost = 1.5 if temporal == "timeless" else 1.0
             recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
             # IDF boost (LIKE path — same as FTS)
-            idf_boost = self._idf_boost_for_row(row, idf)
+            idf_boost, matched_term = self._idf_boost_for_row(row, idf)
             # Relevance floor (parity with FTS path)
-            if idf_boost <= 1.0 and normalized_fts < 0.3:
+            if not matched_term and normalized_fts < 0.3:
                 continue
             score = (
                 normalized_fts

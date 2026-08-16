@@ -246,7 +246,7 @@ class TestConflictSupersession:
                           "Risk cap is 2 percent per trade for FX demo",
                           origin="user_correction")
 
-        results = store.search("risk cap")
+        results, _ = store.search("risk cap")
         ids = [r[0]["id"] for r in results]
         assert old_id not in ids, "Superseded memory appeared in search results"
         assert new_id in ids, "New memory should appear in search results"

@@ -192,13 +192,13 @@ class TestSearch:
     def test_search_finds_matching(self, store):
         store.add("memory", "User prefers Python over JavaScript")
         store.add("memory", "Server runs on port 443")
-        results = store.search("Python")
+        results, _ = store.search("Python")
         assert len(results) >= 1
         assert "Python" in results[0][0]["content"]
 
     def test_search_returns_score(self, store):
         store.add("memory", "important fact about databases")
-        results = store.search("databases")
+        results, _ = store.search("databases")
         assert len(results) == 1
         mem, score = results[0]
         assert isinstance(score, float)
@@ -207,7 +207,7 @@ class TestSearch:
     def test_search_empty_query_returns_importance_ranked(self, store):
         store.add("memory", "low importance", origin="agent_inference")
         store.add("memory", "high importance", origin="user_correction")
-        results = store.search("")
+        results, _ = store.search("")
         assert len(results) == 2
         # User correction should rank higher (higher initial importance)
         assert results[0][0]["importance"] >= results[1][0]["importance"]
@@ -215,14 +215,14 @@ class TestSearch:
     def test_search_with_target_filter(self, store):
         store.add("memory", "agent memory about Python")
         store.add("user", "user preference for Python")
-        results = store.search("Python", target="user")
+        results, _ = store.search("Python", target="user")
         assert len(results) == 1
         assert results[0][0]["target"] == "user"
 
     def test_search_limit(self, store):
         for i in range(20):
             store.add("memory", f"memory item number {i}")
-        results = store.search("memory", limit=5)
+        results, _ = store.search("memory", limit=5)
         assert len(results) <= 5
 
 
@@ -499,7 +499,7 @@ class TestReliabilityRanking:
             origin="research_finding", reliability=0.3,
         )
 
-        results = store.search("DXY")
+        results, _ = store.search("DXY")
         assert len(results) >= 2
 
         # The reliable one should rank higher
