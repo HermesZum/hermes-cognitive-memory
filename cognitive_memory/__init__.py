@@ -322,20 +322,22 @@ class CognitiveMemoryProvider(MemoryProvider):
 
         self._prefetch_failed = False
         try:
-            results = self._store.search(query, limit=self._params.max_context)
-            logger.info("cognitive-memory: prefetch OK (query=%r, results=%d)", query[:50], len(results))
+            results, critical = self._store.search(query, limit=self._params.max_context)
+            logger.info("cognitive-memory: prefetch OK (query=%r, results=%d, critical=%d)", query[:50], len(results), len(critical))
         except Exception as e:
             self._prefetch_failed = True
             logger.error("cognitive-memory: prefetch search FAILED: %s", e, exc_info=True)
             return ""
 
-        if not results:
+        if not results and not critical:
             return ""
 
         # Return raw memory text. Core build_memory_context_block() wraps it
         # with the memory-context fence and system note, so we must not add
         # our own tags here or build_memory_context_block() will strip them.
         lines = []
+
+        # Selectively retrieved memories (relevance-ranked, genuine prefetch)
         for mem, score in results:
             target_label = "USER PROFILE" if mem["target"] == "user" else "MEMORY"
             importance_bar = _importance_bar(mem["importance"])
@@ -345,6 +347,19 @@ class CognitiveMemoryProvider(MemoryProvider):
             for content_line in mem["content"].split("\n"):
                 lines.append(f"  {content_line}")
             lines.append("")
+
+        # Critical safety tier — always-injected, separate budget (Letta core/archival).
+        # Rendered under its own header so the model treats it as standing rules,
+        # not query-matched context. Never competes with selective retrieval slots.
+        if critical:
+            lines.append("CRITICAL (always-on safety rules, regardless of query match):")
+            for mem in critical:
+                target_label = "USER PROFILE" if mem["target"] == "user" else "MEMORY"
+                importance_bar = _importance_bar(mem["importance"])
+                lines.append(f"  {target_label} [{importance_bar}]:")
+                for content_line in mem["content"].split("\n"):
+                    lines.append(f"    {content_line}")
+                lines.append("")
 
         return "\n".join(lines)
 
@@ -619,9 +634,10 @@ class CognitiveMemoryProvider(MemoryProvider):
         # Clamp limit to valid range — no negatives allowed
         limit = max(1, min(int(limit), 30))
 
-        results = self._store.search(query, target=target, limit=limit)
+        results, critical = self._store.search(query, target=target, limit=limit)
         output = {
             "count": len(results),
+            "critical_count": len(critical),
             "memories": [
                 {
                     "id": mem["id"],

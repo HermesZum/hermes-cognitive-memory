@@ -68,6 +68,12 @@ class DecayParams:
     # 7. Max memories to inject per turn
     max_context: int = 15
 
+    # 7b. Critical safety-tier budget — always-injected critical memories
+    #   are rendered in their OWN section and do NOT consume max_context slots.
+    #   Mirrors Letta's core/archival split: the always-on core never
+    #   competes with relevance-ranked archival retrieval for context.
+    critical_budget: int = 5
+
     # Default source confidence by origin type
     source_confidence_defaults: dict = None  # type: ignore
 

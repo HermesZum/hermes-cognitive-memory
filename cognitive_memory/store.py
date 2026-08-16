@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS memories (
     pinned        INTEGER NOT NULL DEFAULT 0,
     temporal      TEXT NOT NULL DEFAULT 'stable',
     superseded    INTEGER NOT NULL DEFAULT 0,
-    supersedes    TEXT DEFAULT NULL
+    supersedes    TEXT DEFAULT NULL,
+    critical      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_target ON memories(target);
@@ -63,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_last_access ON memories(last_access);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned);
 CREATE INDEX IF NOT EXISTS idx_memories_temporal ON memories(temporal);
 CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded);
+CREATE INDEX IF NOT EXISTS idx_memories_critical ON memories(critical);
 """
 
 # Migration SQL for databases created before new columns
@@ -73,6 +75,7 @@ _MIGRATION_SQL = [
     "ALTER TABLE memories ADD COLUMN temporal TEXT NOT NULL DEFAULT 'stable'",
     "ALTER TABLE memories ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE memories ADD COLUMN supersedes TEXT DEFAULT NULL",
+    "ALTER TABLE memories ADD COLUMN critical INTEGER NOT NULL DEFAULT 0",
 ]
 
 _FTS_SCHEMA_SQL = """
@@ -566,6 +569,11 @@ class MemoryStore:
             # Re-rank with cognitive scores — ALL under the lock
             scored = []
             for row in rows:
+                # Criticals live in their own budget tier (see _fetch_critical /
+                # _critical_batch) — exclude from selective scoring to avoid
+                # duplication. They are always injected via the critical section.
+                if row.get("critical"):
+                    continue
                 fts_score = row.pop("fts_score", 0.0)
                 normalized_fts = max(0.0, min(1.0, (-fts_score) / 3.0)) if fts_score != 0 else 0.5
 
@@ -597,22 +605,14 @@ class MemoryStore:
 
             scored.sort(key=lambda x: x[1], reverse=True)
 
-            # Always-inject pinned memories: append any pinned entries not
-            # already in the result set, with a 2x score boost. This ensures
-            # safety-critical rules are available regardless of query match.
+            # Critical safety net: collected separately as its OWN budget tier.
+            # Criticals are NOT appended to `scored` (selective pool) — they are
+            # returned independently so prefetch() renders them in a dedicated
+            # section. This mirrors Letta's core/archival split: the always-on
+            # core never competes with relevance-ranked retrieval for slots.
             result_ids = {row["id"] for row, _ in scored}
-            pinned_sql = "SELECT * FROM memories WHERE pinned = 1 AND superseded = 0"
-            pinned_params: list = []
-            if target:
-                pinned_sql += " AND target = ?"
-                pinned_params.append(target)
-            pinned_rows = [dict(r) for r in self._conn.execute(pinned_sql, pinned_params).fetchall()]
-            for row in pinned_rows:
-                if row["id"] not in result_ids:
-                    top_score = scored[0][1] if scored else 1.0
-                    scored.append((row, top_score * 2.0))
-
-            scored.sort(key=lambda x: x[1], reverse=True)
+            critical_rows = self._fetch_critical(target)
+            critical = self._critical_batch(critical_rows)
 
             # Apply access reinforcement + RIF + auto-pin to top results
             if scored:
@@ -621,7 +621,22 @@ class MemoryStore:
                     [s[0] for s in scored[max_limit:]],
                 )
 
-            return scored[:max_limit]
+            return scored[:max_limit], critical
+
+    def _fetch_critical(self, target: Optional[str]) -> List[Dict[str, Any]]:
+        """Fetch all non-superseded critical memories (safety tier)."""
+        sql = "SELECT * FROM memories WHERE critical = 1 AND superseded = 0"
+        params: list = []
+        if target:
+            sql += " AND target = ?"
+            params.append(target)
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def _critical_batch(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return up to critical_budget critical memories, ranked by importance."""
+        budget = getattr(self._params, "critical_budget", 5)
+        rows.sort(key=lambda r: r.get("importance", 0.0), reverse=True)
+        return rows[:budget]
 
     def _like_search(
         self,
@@ -648,6 +663,9 @@ class MemoryStore:
 
         scored = []
         for row in rows:
+            # Criticals live in their own budget tier — exclude from selective scoring.
+            if row.get("critical"):
+                continue
             fts_score = 0.0
             normalized_fts = 0.5
             temporal = row.get("temporal", "stable")
@@ -674,20 +692,11 @@ class MemoryStore:
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # Always-inject pinned memories in LIKE fallback as well.
+        # Critical safety net: same as FTS path — collected as its OWN budget
+        # tier, NOT appended to the selective pool.
         result_ids = {row["id"] for row, _ in scored}
-        pinned_sql = "SELECT * FROM memories WHERE pinned = 1 AND superseded = 0"
-        pinned_params: list = []
-        if target:
-            pinned_sql += " AND target = ?"
-            pinned_params.append(target)
-        pinned_rows = [dict(r) for r in self._conn.execute(pinned_sql, pinned_params).fetchall()]
-        for row in pinned_rows:
-            if row["id"] not in result_ids:
-                top_score = scored[0][1] if scored else 1.0
-                scored.append((row, top_score * 2.0))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
+        critical_rows = self._fetch_critical(target)
+        critical = self._critical_batch(critical_rows)
 
         if scored:
             self._apply_retrieval_effects_locked(
@@ -695,7 +704,7 @@ class MemoryStore:
                 [s[0] for s in scored[max_limit:]],
             )
 
-        return scored[:max_limit]
+        return scored[:max_limit], critical
 
     def _importance_based_retrieval(
         self,
