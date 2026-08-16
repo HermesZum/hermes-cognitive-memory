@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -127,16 +128,65 @@ def _sanitize_fts_query(query: str) -> str:
     import re
     # Strip FTS5 operators that would change query semantics if left bare
     cleaned = re.sub(r'[\*\+\-\:\(\)\{\}\^\~]', ' ', query)
-    tokens = [t for t in cleaned.split() if len(t) > 2]
+    tokens = [t for t in cleaned.split() if len(t) > 2 and t.lower() not in _STOPWORDS]
     if not tokens:
-        # Fallback: quote the whole thing as a phrase
+        # Fallback: quote the whole thing as a phrase (or a single token)
         safe = query.replace('"', '""')
         return f'"{safe}"'
     quoted = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in tokens]
     return " OR ".join(quoted)
 
 
+# English stopwords dropped from FTS term expansion. These are high-frequency
+# words that appear in many memories and would otherwise dominate OR-based
+# retrieval (e.g. "the" matches 4 memories, skewing re-ranking toward
+# top-importance rather than semantically relevant results).
+_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "this", "that", "what", "are", "was", "were",
+    "has", "have", "had", "you", "your", "not", "but", "all", "any", "from",
+    "into", "they", "their", "our", "can", "will", "would", "should", "could",
+    "when", "where", "which", "who", "whom", "how", "why", "than", "then",
+    "there", "here", "about", "over", "under", "between", "before", "after",
+    "during", "while", "because", "since", "though", "although", "unless",
+    "until", "against", "through", "within", "without", "upon", "among",
+    "does", "did", "done", "doing", "been", "being", "its", "it's", "don't",
+    "doesn't", "didn't", "won't", "can't", "shouldn't", "wouldn't", "isn't",
+    "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't", "let's",
+    "that's", "what's", "who's", "it's", "there's", "here's", "i'm", "you're",
+    "we're", "they're", "he's", "she's", "my", "me", "we", "us", "him", "her",
+    "them", "his", "hers", "its", "own", "same", "such", "only", "also",
+    "more", "most", "some", "much", "many", "few", "little", "other", "another",
+    "each", "every", "both", "either", "neither", "one", "two", "three",
+    "first", "last", "new", "old", "good", "bad", "well", "just", "very",
+    "really", "please", "thanks", "thank", "yes", "no", "ok", "okay", "sure",
+    "maybe", "perhaps", "probably", "actually", "basically", "essentially",
+    "generally", "typically", "usually", "often", "sometimes", "always",
+    "never", "ever", "already", "still", "yet", "even", "only", "also",
+})
+
+
+def _strip_operators(query: str) -> str:
+    """Remove FTS5 special operators so a query can be tokenized for IDF."""
+    import re
+    return re.sub(r'[\*\+\-\:\(\)\{\}\^\~"]', ' ', query)
+
+
+def _term_doc_freq(conn, term: str) -> int:
+    """Return the number of active memories containing ``term`` (FTS5)."""
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) c FROM memories_fts "
+            "JOIN memories m ON m.rowid = memories_fts.rowid "
+            "WHERE memories_fts MATCH ? AND m.superseded = 0",
+            (f'"{term}"',),
+        )
+        return cur.fetchone()["c"]
+    except sqlite3.OperationalError:
+        return 0
+
+
 class MemoryStore:
+
     """SQLite-backed memory store with FTS5 and cognitive decay."""
 
     def __init__(self, db_path: Path, params: DecayParams):
@@ -518,6 +568,42 @@ class MemoryStore:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    # -- IDF helpers (term-frequency weighting for selective retrieval) -------
+
+    def _idf_for_terms(self, terms: List[str]) -> Dict[str, float]:
+        """Compute smoothed IDF for each query term.
+
+        idf = ln((N - df + 0.5) / (df + 0.5)) + 1  (BM25-style, always >= 1 so
+        common terms don't get zeroed). Higher idf = rarer term = more weight.
+        """
+        if not self._conn:
+            return {}
+        total = self.count()
+        if total <= 0:
+            return {}
+        idf: Dict[str, float] = {}
+        for t in terms:
+            df = _term_doc_freq(self._conn, t)
+            df = max(1, df)  # avoid div-by-zero / log(0)
+            idf[t] = math.log((total - df + 0.5) / (df + 0.5)) + 1.0
+        return idf
+
+    def _idf_boost_for_row(self, row: Dict[str, Any], idf: Dict[str, float]) -> float:
+        """Return an IDF boost multiplier for a memory row.
+
+        If the memory's content matches any query term, the boost is the max
+        idf among matched terms (rarer matched term → higher boost). If no
+        query term matches, boost = 1.0 (no penalty — FTS already matched it).
+        """
+        if not idf:
+            return 1.0
+        content = (row.get("content") or "").lower()
+        matched = [v for t, v in idf.items() if t in content]
+        if not matched:
+            return 1.0
+        # Max IDF among matched terms — rewards matching the rarest term
+        return max(matched)
+
     def search(
         self,
         query: str,
@@ -581,6 +667,13 @@ class MemoryStore:
 
             # Re-rank with cognitive scores — ALL under the lock
             scored = []
+            # Pre-compute inverse document frequency (IDF) for each query term so
+            # that rare, specific terms weigh more than ubiquitous ones (e.g.
+            # "pkill" outranks "hermes" which appears in 19/29 memories). This is
+            # standard BM25-style weighting and prevents high-frequency tokens
+            # from flooding the selective budget.
+            query_terms = [t.lower() for t in _strip_operators(query).split() if len(t) > 2 and t.lower() not in _STOPWORDS]
+            idf = self._idf_for_terms(query_terms) if query_terms else {}
             for row in rows:
                 # Criticals live in their own budget tier (see _fetch_critical /
                 # _critical_batch) — exclude from selective scoring to avoid
@@ -605,6 +698,17 @@ class MemoryStore:
                 temporal_boost = 1.5 if temporal == "timeless" else 1.0
                 recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
 
+                # IDF term-match boost: memories matching rarer query terms rank higher
+                idf_boost = self._idf_boost_for_row(row, idf)
+
+                # Relevance floor: drop results that neither matched a query term
+                # (idf_boost == 1.0) nor have meaningful FTS relevance. This
+                # prevents pure high-importance memories from flooding the
+                # selective budget when the query has no real semantic match
+                # (they still surface via the critical tier if safety-relevant).
+                if idf_boost <= 1.0 and normalized_fts < 0.3:
+                    continue
+
                 score = (
                     normalized_fts
                     * decayed_importance
@@ -613,6 +717,7 @@ class MemoryStore:
                     * hard_to_find
                     * temporal_boost
                     * recency_boost
+                    * idf_boost
                 )
                 scored.append((row, score))
 
@@ -674,6 +779,10 @@ class MemoryStore:
         cur = self._conn.execute(sql, params)
         rows = [dict(r) for r in cur.fetchall()]
 
+        # Pre-compute IDF for query terms (parity with FTS path)
+        query_terms = [t.lower() for t in _strip_operators(query).split() if len(t) > 2 and t.lower() not in _STOPWORDS]
+        idf = self._idf_for_terms(query_terms) if query_terms else {}
+
         scored = []
         for row in rows:
             # Criticals live in their own budget tier — exclude from selective scoring.
@@ -692,6 +801,11 @@ class MemoryStore:
             hard_to_find = 2.0 if row.get("hard_to_find") else 1.0
             temporal_boost = 1.5 if temporal == "timeless" else 1.0
             recency_boost = 1.0 + max(0.0, (3600.0 - max(0.0, now - row.get("last_access", now))) / 3600.0) * 0.25
+            # IDF boost (LIKE path — same as FTS)
+            idf_boost = self._idf_boost_for_row(row, idf)
+            # Relevance floor (parity with FTS path)
+            if idf_boost <= 1.0 and normalized_fts < 0.3:
+                continue
             score = (
                 normalized_fts
                 * decayed_importance
@@ -700,6 +814,7 @@ class MemoryStore:
                 * hard_to_find
                 * temporal_boost
                 * recency_boost
+                * idf_boost
             )
             scored.append((row, score))
 
