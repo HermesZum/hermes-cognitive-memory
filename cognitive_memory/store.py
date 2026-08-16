@@ -570,6 +570,11 @@ class MemoryStore:
              int(merged_hard), int(merged_pinned), merged_temporal, existing_id),
         )
         self._conn.commit()
+        # Re-embed with the merged content so the semantic vector matches what
+        # is now stored. Done here (not just in the add() caller) so embedding
+        # consistency holds no matter who invokes the merge. Network call is
+        # best-effort and swallowed inside _embed_and_store.
+        self._embed_and_store(existing_id, merged_content)
 
     def _find_conflict_locked(self, target: str, content: str) -> Optional[str]:
         """Find an existing memory that the new content conflicts with.
@@ -616,8 +621,13 @@ class MemoryStore:
                 "UPDATE memories SET content = ? WHERE id = ?",
                 (new_content, mem_id),
             )
+            changed = cur.rowcount > 0
             self._conn.commit()
-            return cur.rowcount > 0
+        # Re-embed with the new content (best-effort) so semantic search
+        # reflects the update instead of the stale pre-replace vector.
+        if changed:
+            self._embed_and_store(mem_id, new_content)
+        return changed
 
     def remove(self, mem_id: str) -> bool:
         """Delete a memory by ID."""
@@ -625,6 +635,10 @@ class MemoryStore:
             assert self._conn is not None
             cur = self._conn.execute(
                 "DELETE FROM memories WHERE id = ?", (mem_id,)
+            )
+            # Drop the orphaned embedding row too (no FK cascade).
+            self._conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?", (mem_id,)
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -656,10 +670,21 @@ class MemoryStore:
         escaped = content_substring.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
             assert self._conn is not None
+            # Collect matching ids first so we can drop their embeddings too.
+            ids = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM memories WHERE content LIKE ? ESCAPE '\\'",
+                (f"%{escaped}%",),
+            ).fetchall()]
             cur = self._conn.execute(
                 "DELETE FROM memories WHERE content LIKE ? ESCAPE '\\'",
                 (f"%{escaped}%",),
             )
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                self._conn.execute(
+                    f"DELETE FROM memory_embeddings WHERE memory_id IN ({placeholders})",
+                    ids,
+                )
             self._conn.commit()
             return cur.rowcount
 

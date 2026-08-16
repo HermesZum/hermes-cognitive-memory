@@ -151,3 +151,62 @@ def test_backfill_is_idempotent(monkeypatch):
     assert n1 == 2
     assert n2 == 0
     s.close()
+
+
+def test_replace_reembeds_content():
+    """replace() must update the stored embedding to match new content.
+
+    Regression guard: without this, semantic search keeps matching the
+    stale pre-replace text (embedding drift bug).
+    """
+    s = MemoryStore(Path(tempfile.mkdtemp()) / "t.db", DecayParams())
+    s.connect()
+    s._embedding_backend = _FakeBackend()
+    s._embedding_enabled = True
+    mid = s.add("memory", "original content about apples")
+    old_vec = s._get_embedding(mid)
+    assert old_vec is not None
+    s.replace(mid, "completely different text about oranges")
+    new_vec = s._get_embedding(mid)
+    assert new_vec is not None
+    # Fake backend embeddings depend on token set, so different content
+    # must produce a different vector.
+    assert new_vec != old_vec
+    s.close()
+
+
+def test_merge_reembeds_content():
+    """Merging a duplicate must re-embed with the merged content."""
+    s = MemoryStore(Path(tempfile.mkdtemp()) / "t.db", DecayParams())
+    s.connect()
+    s._embedding_backend = _FakeBackend()
+    s._embedding_enabled = True
+    mid = s.add("memory", "base fact about networking")
+    old_vec = s._get_embedding(mid)
+    assert old_vec is not None
+    # Directly exercise the merge path (deterministic, bypasses dedup threshold)
+    with s._lock:
+        s._merge_locked(mid, "base fact about networking and also DNS specifics",
+                        new_importance=0.8, new_confidence=0.8, new_reliability=1.0,
+                        new_hard_to_find=False, new_pinned=False, new_temporal="stable")
+    new_vec = s._get_embedding(mid)
+    assert new_vec is not None
+    assert new_vec != old_vec  # content changed -> embedding changed
+    merged = s.get(mid)
+    assert merged is not None
+    assert "dns" in merged["content"].lower()
+    s.close()
+
+
+def test_remove_drops_embedding_row():
+    """remove() must also delete the orphaned embedding row."""
+    s = MemoryStore(Path(tempfile.mkdtemp()) / "t.db", DecayParams())
+    s.connect()
+    s._embedding_backend = _FakeBackend()
+    s._embedding_enabled = True
+    mid = s.add("memory", "something to delete")
+    assert s._get_embedding(mid) is not None
+    s.remove(mid)
+    # Embedding row should be gone (query returns None)
+    assert s._get_embedding(mid) is None
+    s.close()
