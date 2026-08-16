@@ -213,6 +213,9 @@ class MemoryStore:
         self._embedding_url = _emb_mod.DEFAULT_URL
         self._embedding_alpha = 0.6  # weight on lexical vs semantic in fusion
         self._semantic_floor = 0.45  # min cosine for a semantic-only match to count
+        # MMR (Maximal Marginal Relevance) diversity re-ranking of the selective pool.
+        self._mmr_enabled = True
+        self._mmr_lambda = 0.7  # 0.0 = pure relevance, 1.0 = max diversity
         # Prune log path — next to the DB
         self._prune_log_path = db_path.parent / "prune_log.md"
 
@@ -314,6 +317,8 @@ class MemoryStore:
         url: str = _emb_mod.DEFAULT_URL,
         alpha: float = 0.6,
         semantic_floor: float = 0.45,
+        mmr_enabled: bool = True,
+        mmr_lambda: float = 0.7,
     ) -> None:
         """Configure hybrid (dense + lexical) retrieval.
 
@@ -325,6 +330,8 @@ class MemoryStore:
         self._embedding_url = url
         self._embedding_alpha = max(0.0, min(1.0, alpha))
         self._semantic_floor = max(0.0, min(1.0, semantic_floor))
+        self._mmr_enabled = mmr_enabled
+        self._mmr_lambda = max(0.0, min(1.0, mmr_lambda))
         # Force re-resolution on next use.
         self._embedding_backend = None
 
@@ -773,12 +780,15 @@ class MemoryStore:
         target: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Tuple[Dict[str, Any], float]]:
-        """FTS5 search with cognitive relevance ranking.
+        """FTS5 search with cognitive relevance ranking + MMR diversity.
 
-        Returns a list of (memory_dict, score) tuples sorted by score DESC.
-        Score = normalized_fts_rank * decayed_importance * decayed_confidence * reliability.
-
-        Superseded memories are excluded from search results.
+        Returns a (results, critical) tuple: results is a list of
+        (memory_dict, score) tuples sorted by score DESC (score = fused
+        lexical+semantic * decayed_importance * ... * idf_boost), diversity
+        re-ranked via MMR when enabled; critical is the always-on safety tier.
+        NOTE: the empty-query and LIKE-fallback early-return paths currently
+        return a bare results list, not the (results, critical) tuple — a
+        pre-existing inconsistency tracked separately from the MMR work.
 
         The entire operation (fetch + rank + retrieval effects) runs under
         the lock to prevent lost updates from concurrent apply_global_decay()
@@ -921,23 +931,76 @@ class MemoryStore:
 
             scored.sort(key=lambda x: x[1], reverse=True)
 
+            # MMR diversity re-ranking over the candidate pool. Does NOT touch
+            # the critical safety tier, which is collected separately below.
+            selected = self._mmr_rerank(scored, max_limit, self._mmr_lambda)
+
             # Critical safety net: collected separately as its OWN budget tier.
-            # Criticals are NOT appended to `scored` (selective pool) — they are
-            # returned independently so prefetch() renders them in a dedicated
-            # section. This mirrors Letta's core/archival split: the always-on
-            # core never competes with relevance-ranked retrieval for slots.
-            result_ids = {row["id"] for row, _ in scored}
+            # Criticals are NOT appended to `selected` (selective pool) — they
+            # are returned independently so prefetch() renders them in a
+            # dedicated section. This mirrors Letta's core/archival split: the
+            # always-on core never competes with relevance-ranked retrieval for
+            # slots.
+            result_ids = {row["id"] for row, _ in selected}
             critical_rows = self._fetch_critical(target)
             critical = self._critical_batch(critical_rows)
 
             # Apply access reinforcement + RIF + auto-pin to top results
-            if scored:
+            if selected:
                 self._apply_retrieval_effects_locked(
-                    [s[0] for s in scored[:max_limit]],
-                    [s[0] for s in scored[max_limit:]],
+                    [s[0] for s in selected[:max_limit]],
+                    [s[0] for s in selected[max_limit:]],
                 )
 
-            return scored[:max_limit], critical
+            return selected[:max_limit], critical
+
+    def _mmr_rerank(
+        self,
+        candidates: List[Tuple[Dict[str, Any], float]],
+        k: int,
+        lambda_: float = 0.7,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """Greedy Maximal Marginal Relevance over the scored candidate pool.
+
+        ``mmr(c) = (1 - λ)·relevance(c) - λ·max_sim(c, already_selected)``.
+        Deduplicates near-identical memories (e.g. several "vault brain"
+        notes) so they don't consume multiple slots in the selective budget.
+        The critical safety tier is handled separately and never passed here.
+
+        If MMR is disabled or no embeddings are available the candidates are
+        returned in relevance order (no dedup, no crash).
+        """
+        if not candidates or not self._mmr_enabled:
+            return candidates[:k]
+        # Load each candidate's stored embedding once (missing => no similarity).
+        emb: Dict[str, List[float]] = {}
+        for row, _ in candidates:
+            e = self._get_embedding(row["id"])
+            if e is not None:
+                emb[row["id"]] = e
+        selected: List[Tuple[Dict[str, Any], float]] = []
+        selected_embs: List[List[float]] = []
+        remaining = list(candidates)
+        while remaining and len(selected) < k:
+            best_i, best_mmr = None, None
+            for i, (row, score) in enumerate(remaining):
+                sim = 0.0
+                e = emb.get(row["id"])
+                if e is not None and selected_embs:
+                    sim = max(
+                        _emb_mod.cosine_similarity(e, se) for se in selected_embs
+                    )
+                mmr = (1.0 - lambda_) * score - lambda_ * sim
+                if best_mmr is None or mmr > best_mmr:
+                    best_mmr, best_i = mmr, i
+            if best_i is None:
+                break
+            row, score = remaining.pop(best_i)
+            selected.append((row, score))
+            e = emb.get(row["id"])
+            if e is not None:
+                selected_embs.append(e)
+        return selected
 
     def _fetch_critical(self, target: Optional[str]) -> List[Dict[str, Any]]:
         """Fetch all non-superseded critical memories (safety tier)."""

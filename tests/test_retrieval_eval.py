@@ -330,8 +330,55 @@ class TestRetrievalEval:
             assert r >= 0.5, f"semantic recall {r:.2f} < 0.5 for {query!r}"
 
 
-# --------------------------------------------------------------------------
-# CLI metric report (python tests/test_retrieval_eval.py)
+    @pytest.mark.skipif(not SEMANTIC_AVAILABLE,
+                        reason="Ollama nomic-embed-text not available")
+    def test_mmr_dedups_near_identical(self, store):
+        """MMR must not let several near-identical memories flood the pool.
+
+        Deterministic regression guard: stubs the embedding lookup with
+        controlled vectors (3 near-identical cluster A + 3 distinct clusters
+        B/C/D, all with comparable relevance) so the test exercises the MMR
+        re-ranking logic itself, not Ollama's actual vector spread. With pure
+        relevance the top-3 would be 3 near-duplicates; with MMR (lambda=0.7)
+        at most one duplicate survives and the distinct memories do.
+        """
+        s, _ = store
+        # Controlled vectors: A repeated 3x (near-dup cluster), B/C/D distinct.
+        A = [1.0, 0.0, 0.0, 0.0]
+        B = [0.0, 1.0, 0.0, 0.0]
+        C = [0.0, 0.0, 1.0, 0.0]
+        D = [0.0, 0.0, 0.0, 1.0]
+        vecs = {"v1": A, "v2": A, "v3": A, "d1": B, "d2": C, "d3": D}
+        s._get_embedding = lambda mid: vecs.get(mid)
+
+        # Candidate pool directly (bypass FTS/semantic-floor noise):
+        # 3 near-dups with slightly higher fused scores + 3 distinct.
+        cands = [
+            ({"id": "v1", "content": "dup"}, 1.00),
+            ({"id": "v2", "content": "dup"}, 0.99),
+            ({"id": "v3", "content": "dup"}, 0.98),
+            ({"id": "d1", "content": "dist"}, 0.95),
+            ({"id": "d2", "content": "dist"}, 0.94),
+            ({"id": "d3", "content": "dist"}, 0.93),
+        ]
+        s.configure_embeddings(enabled=True, mmr_enabled=False, mmr_lambda=0.7)
+        r_off = s._mmr_rerank(cands, k=3, lambda_=0.7)  # lambda irrelevant when disabled
+        off_ids = [m["id"] for m, _ in r_off]
+        variants_off = sum(i.startswith("v") for i in off_ids)
+
+        s.configure_embeddings(enabled=True, mmr_enabled=True, mmr_lambda=0.7)
+        r_on = s._mmr_rerank(cands, k=3, lambda_=0.7)
+        on_ids = [m["id"] for m, _ in r_on]
+        variants_on = sum(i.startswith("v") for i in on_ids)
+        distinct_present = any(i.startswith("d") for i in on_ids)
+
+        # Pure relevance control must cluster the duplicates (sanity).
+        assert variants_off >= 2, f"control not clustering dups: {off_ids}"
+        # MMR must reduce duplication and keep a distinct memory.
+        assert variants_on <= 1, (
+            f"MMR leaked {variants_on} near-duplicates (control had {variants_off})")
+        assert distinct_present, "MMR dropped every distinct memory"
+
 # --------------------------------------------------------------------------
 def _build_store_for_cli():
     """Build a CLI store and return (store, id_map)."""
