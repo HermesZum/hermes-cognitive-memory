@@ -112,15 +112,28 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
 def _sanitize_fts_query(query: str) -> str:
     """Sanitize a user query for FTS5 MATCH.
 
-    Escapes double quotes and strips FTS5 special operators (*, NEAR, :, -, +)
-    from the unquoted portion to prevent unexpected query semantics.
-    The result is a quoted phrase match — safe and predictable.
+    Splits the query into individual terms and ORs them together
+    (``term1 OR term2 OR ...``) so that ANY matching term retrieves a
+    memory. This is the standard RAG retrieval behaviour — a natural
+    multi-word user message like "What are the security rules?" should
+    match memories containing "security" OR "rules", not require the
+    exact contiguous phrase.
+
+    Terms are individually double-quoted (FTS5 string literals) so special
+    characters (*, NEAR, :, -, +) are inert. Stopwords and very short
+    tokens are dropped to avoid noise matches. If no usable terms remain,
+    the whole query is returned quoted as a phrase fallback.
     """
-    # Escape double quotes for FTS5 string literal
-    safe = query.replace('"', '""')
-    # Return as a quoted phrase — this is a prefix match, not a full
-    # boolean query, so FTS5 special chars are inert inside quotes.
-    return f'"{safe}"'
+    import re
+    # Strip FTS5 operators that would change query semantics if left bare
+    cleaned = re.sub(r'[\*\+\-\:\(\)\{\}\^\~]', ' ', query)
+    tokens = [t for t in cleaned.split() if len(t) > 2]
+    if not tokens:
+        # Fallback: quote the whole thing as a phrase
+        safe = query.replace('"', '""')
+        return f'"{safe}"'
+    quoted = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in tokens]
+    return " OR ".join(quoted)
 
 
 class MemoryStore:
@@ -753,7 +766,10 @@ class MemoryStore:
                     [s[0] for s in scored[max_limit:]],
                 )
 
-            return scored[:max_limit]
+            # Return a tuple for parity with search()'s FTS/LIKE paths, which
+            # return (results, critical). The empty-query path has no critical
+            # tier, but callers (e.g. _handle_search) always unpack as a tuple.
+            return scored[:max_limit], []
 
     def _apply_retrieval_effects_locked(
         self,
