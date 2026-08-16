@@ -170,10 +170,17 @@ def _relevant_combined(store, query, k):
 # Metric helpers
 # --------------------------------------------------------------------------
 def _precision_at_k(topk_ids, expected, k):
+    """Fraction of retrieved memories that are relevant.
+
+    Uses the FULL retrieved set (not sliced to k) for consistency with
+    _recall_at_k: the combined retrieval (selective + critical) can exceed k
+    and the agent sees ALL of it, so precision must measure the entire shown
+    set. Returns 1.0 if nothing is retrieved.
+    """
     if not topk_ids:
-        return 0.0
-    hits = sum(1 for i in topk_ids[:k] if i in expected)
-    return hits / len(topk_ids[:k])
+        return 1.0
+    hits = sum(1 for i in topk_ids if i in expected)
+    return hits / len(topk_ids)
 
 
 def _recall_at_k(topk_ids, expected, k):
