@@ -779,16 +779,17 @@ class MemoryStore:
         query: str,
         target: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> Tuple[List[Tuple[Dict[str, Any], float]], List[Dict[str, Any]]]:
         """FTS5 search with cognitive relevance ranking + MMR diversity.
 
-        Returns a (results, critical) tuple: results is a list of
-        (memory_dict, score) tuples sorted by score DESC (score = fused
-        lexical+semantic * decayed_importance * ... * idf_boost), diversity
-        re-ranked via MMR when enabled; critical is the always-on safety tier.
-        NOTE: the empty-query and LIKE-fallback early-return paths currently
-        return a bare results list, not the (results, critical) tuple — a
-        pre-existing inconsistency tracked separately from the MMR work.
+        Returns a (results, critical) tuple consistently across ALL paths —
+        the FTS path, the LIKE-fallback path, the empty-query path, and both
+        no-connection guards:
+        - ``results``: list of (memory_dict, score) tuples sorted by score DESC
+          (score = fused lexical+semantic * decayed_importance * ... * idf_boost),
+          diversity re-ranked via MMR when enabled.
+        - ``critical``: always-on safety-tier memories (their own budget),
+          never part of the selective ``results`` pool.
 
         The entire operation (fetch + rank + retrieval effects) runs under
         the lock to prevent lost updates from concurrent apply_global_decay()
@@ -803,7 +804,7 @@ class MemoryStore:
 
         with self._lock:
             if not self._conn:
-                return []
+                return [], []
 
             if not self._fts_available:
                 # LIKE-based fallback when FTS5 is not available
@@ -1023,7 +1024,7 @@ class MemoryStore:
         target: Optional[str],
         max_limit: int,
         now: float,
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> Tuple[List[Tuple[Dict[str, Any], float]], List[Dict[str, Any]]]:
         """LIKE-based search fallback when FTS5 is not available.
 
         MUST be called with self._lock held.
@@ -1099,7 +1100,7 @@ class MemoryStore:
         self,
         target: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> Tuple[List[Tuple[Dict[str, Any], float]], List[Dict[str, Any]]]:
         """When there's no query, return memories ranked by importance.
 
         Runs entirely under the lock to prevent race conditions.
@@ -1109,7 +1110,7 @@ class MemoryStore:
 
         with self._lock:
             if not self._conn:
-                return []
+                return [], []
 
             sql = "SELECT * FROM memories WHERE superseded = 0"
             params: list = []
