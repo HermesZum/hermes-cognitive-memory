@@ -139,11 +139,41 @@ EVAL_CASES = [
     ("FX demo trading rules", {"mem_fx_demo"}, 5),
     # Definition of done
     ("definition of done gates", {"mem_definition_done"}, 5),
-    # Unrelated query -> no selective (only critical tier handles it)
-    ("weather in Lisbon", set(), 5),
-    # Stopword-heavy query -> no noise from 'the'
-    ("audit second pass the selective prefetch", set(), 5),
+    # Genuinely-unrelated queries -> no selective (only critical tier handles it)
+    ("how to tune a guitar", set(), 5),
+    ("best recipe for bacalhau", set(), 5),
 ]
+
+# Semantic (paraphrase) eval cases — these are the queries lexical-only
+# retrieval MISSes. They only pass when the dense/semantic path is active
+# (Ollama nomic-embed-text available). Guarded by SEMANTIC_AVAILABLE so the
+# harness stays green in CI without a local embedding model.
+SEMANTIC_CASES = [
+    # "never assume target branch is main" — wording differs from corpus
+    ("how do I push code safely without breaking things?",
+     {"mem_git_branch"}, 5),
+    # "never use pkill -f hermes (kills SSH)" — phrased as a question
+    ("is it safe to kill the hermes process from the terminal?",
+     {"mem_ssh_user", "mem_pkill_rule"}, 5),
+    # "never commit real environment data to public GitHub" — paraphrase
+    ("what must never go into a public git repository?",
+     {"mem_security_rules"}, 5),
+]
+
+
+def _ollama_available() -> bool:
+    """True if Ollama is reachable AND nomic-embed-text can serve embeddings."""
+    try:
+        from cognitive_memory import embeddings as _emb
+        backend = _emb.OllamaEmbeddingBackend()
+        if not backend.available:
+            return False
+        return backend.embed("probe") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+SEMANTIC_AVAILABLE = _ollama_available()
 
 
 def _relevant_in_topk(store, query, k):
@@ -230,9 +260,30 @@ class TestRetrievalEval:
         topk = _relevant_in_topk(s, "weather in Lisbon", 5)
         assert topk == []
 
-    def test_stopword_query_has_no_noise(self, store):
-        """Stopword-heavy query must not surface top-importance noise via 'the'."""
+    def test_unrelated_queries_have_no_selective_noise(self, store):
+        """Genuinely-unrelated queries must not surface selective memories.
+
+        Under hybrid retrieval, in-domain queries legitimately return
+        semantically-related memories. Only truly-unrelated queries (guitar,
+        recipe) should yield an empty selective pool. This guards against the
+        semantic floor being too low (which would let ~0.38-0.40 cosine
+        'unrelated' matches pollute retrieval).
+        """
         s, _ = store
+        s.configure_embeddings(enabled=True)
+        for q in ("how to tune a guitar", "best recipe for bacalhau"):
+            topk = _relevant_in_topk(s, q, 5)
+            assert topk == [], f"unrelated query {q!r} returned selective: {topk}"
+
+    def test_stopword_query_no_lexical_noise(self, store):
+        """Stopword-heavy query must not surface 'the'-only lexical noise.
+
+        Verified in lexical-only mode (semantic off) so we isolate the
+        original regression: the stopword filter must drop 'the' so it can't
+        match 4 memories and flood the budget.
+        """
+        s, _ = store
+        s.configure_embeddings(enabled=False)
         topk = _relevant_in_topk(s, "audit second pass the selective prefetch", 5)
         assert topk == []
 
@@ -260,6 +311,23 @@ class TestRetrievalEval:
             r = _recall_at_k(topk, expected_real, k)
             if expected:
                 assert r >= 0.5, f"recall {r:.2f} < 0.5 for {query!r} (got {topk})"
+
+    @pytest.mark.skipif(not SEMANTIC_AVAILABLE,
+                        reason="Ollama nomic-embed-text not available")
+    def test_semantic_paraphrase_recall(self, store):
+        """Paraphrase queries must surface their target via the dense path.
+
+        This is the regression guard for hybrid retrieval: lexical-only misses
+        these (different wording), so if it passes, the semantic fusion works.
+        Skipped when the embedding backend is unreachable (CI without Ollama).
+        """
+        s, id_map = store
+        s.configure_embeddings(enabled=True)  # ensure hybrid is on
+        for query, expected, k in SEMANTIC_CASES:
+            expected_real = {id_map[e] for e in expected}
+            topk = _relevant_combined(s, query, k)
+            r = _recall_at_k(topk, expected_real, k)
+            assert r >= 0.5, f"semantic recall {r:.2f} < 0.5 for {query!r}"
 
 
 # --------------------------------------------------------------------------

@@ -36,6 +36,8 @@ from .decay import (
     should_prune,
 )
 
+from . import embeddings as _emb_mod
+
 logger = logging.getLogger(__name__)
 
 _BASE_SCHEMA_SQL = """
@@ -66,6 +68,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned);
 CREATE INDEX IF NOT EXISTS idx_memories_temporal ON memories(temporal);
 CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded);
 CREATE INDEX IF NOT EXISTS idx_memories_critical ON memories(critical);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY,
+    model     TEXT NOT NULL,
+    dim       INTEGER NOT NULL,
+    vector    BLOB NOT NULL
+);
 """
 
 # Migration SQL for databases created before new columns
@@ -196,6 +205,14 @@ class MemoryStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._connected = False
         self._fts_available = False
+        # Embedding backend for hybrid (dense + lexical) retrieval.
+        # Lazily resolved on first use; defaults to NoOp (lexical-only).
+        self._embedding_backend: Optional[_emb_mod.EmbeddingBackend] = None
+        self._embedding_enabled = True
+        self._embedding_model = _emb_mod.DEFAULT_MODEL
+        self._embedding_url = _emb_mod.DEFAULT_URL
+        self._embedding_alpha = 0.6  # weight on lexical vs semantic in fusion
+        self._semantic_floor = 0.45  # min cosine for a semantic-only match to count
         # Prune log path — next to the DB
         self._prune_log_path = db_path.parent / "prune_log.md"
 
@@ -288,6 +305,122 @@ class MemoryStore:
                 self._conn = None
             self._connected = False
 
+    # -- Embedding configuration (hybrid retrieval) ------------------------
+
+    def configure_embeddings(
+        self,
+        enabled: bool = True,
+        model: str = _emb_mod.DEFAULT_MODEL,
+        url: str = _emb_mod.DEFAULT_URL,
+        alpha: float = 0.6,
+        semantic_floor: float = 0.45,
+    ) -> None:
+        """Configure hybrid (dense + lexical) retrieval.
+
+        Call before first search if you want semantic recall. If disabled or
+        the backend is unreachable, retrieval degrades to lexical-only.
+        """
+        self._embedding_enabled = enabled
+        self._embedding_model = model
+        self._embedding_url = url
+        self._embedding_alpha = max(0.0, min(1.0, alpha))
+        self._semantic_floor = max(0.0, min(1.0, semantic_floor))
+        # Force re-resolution on next use.
+        self._embedding_backend = None
+
+    def _get_embedding_backend(self) -> Optional[_emb_mod.EmbeddingBackend]:
+        """Lazily resolve (and cache) the embedding backend."""
+        if self._embedding_backend is None:
+            self._embedding_backend = _emb_mod.get_embedding_backend(
+                enabled=self._embedding_enabled,
+                model=self._embedding_model,
+                url=self._embedding_url,
+            )
+        return self._embedding_backend
+
+    def _embed_and_store(self, memory_id: str, content: str) -> None:
+        """Compute an embedding for content and persist it. Best-effort.
+
+        Any failure is logged and swallowed — lexical retrieval must never
+        break because of an embedding problem.
+        """
+        if not self._embedding_enabled:
+            return
+        backend = self._get_embedding_backend()
+        if backend is None or not backend.available:
+            return
+        try:
+            vec = backend.embed(content)
+            if not vec:
+                return
+            with self._lock:
+                if not self._conn:
+                    return
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings "
+                    "(memory_id, model, dim, vector) VALUES (?, ?, ?, ?)",
+                    (memory_id, backend.model, len(vec),
+                     _emb_mod.pack_vector(vec)),
+                )
+                self._conn.commit()
+        except Exception as e:  # noqa: BLE001 - never break writes
+            logger.warning("cognitive-memory: embed+store failed (%s)", e)
+
+    def _get_embedding(self, memory_id: str) -> Optional[List[float]]:
+        """Fetch a stored embedding vector for a memory, or None."""
+        try:
+            with self._lock:
+                if not self._conn:
+                    return None
+                row = self._conn.execute(
+                    "SELECT vector FROM memory_embeddings WHERE memory_id = ?",
+                    (memory_id,),
+                ).fetchone()
+            if not row:
+                return None
+            return _emb_mod.unpack_vector(row["vector"])
+        except Exception:  # noqa: BLE001
+            return None
+
+    def backfill_embeddings(self) -> int:
+        """Embed all existing (non-superseded) memories lacking a vector.
+
+        Idempotent: skips rows that already have an embedding. Returns the
+        number of memories embedded. Run once after deploying hybrid retrieval.
+        """
+        if not self._embedding_enabled:
+            return 0
+        backend = self._get_embedding_backend()
+        if backend is None or not backend.available:
+            logger.warning("cognitive-memory: backfill skipped (backend unavailable)")
+            return 0
+        with self._lock:
+            if not self._conn:
+                return 0
+            rows = self._conn.execute(
+                "SELECT id, content FROM memories WHERE superseded = 0"
+            ).fetchall()
+        count = 0
+        for row in rows:
+            if self._get_embedding(row["id"]) is not None:
+                continue
+            vec = backend.embed(row["content"])
+            if not vec:
+                continue
+            with self._lock:
+                if not self._conn:
+                    break
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings "
+                    "(memory_id, model, dim, vector) VALUES (?, ?, ?, ?)",
+                    (row["id"], backend.model, len(vec),
+                     _emb_mod.pack_vector(vec)),
+                )
+                self._conn.commit()
+            count += 1
+        logger.info("cognitive-memory: backfilled %d embeddings", count)
+        return count
+
     # -- Write operations ---------------------------------------------------
 
     def add(
@@ -357,6 +490,8 @@ class MemoryStore:
                  temporal, None),
             )
             self._conn.commit()
+        # Embed for hybrid retrieval (best-effort; lexical-only if it fails)
+        self._embed_and_store(mem_id, content)
         logger.debug(
             "cognitive-memory: added memory %s (origin=%s, importance=%.2f, "
             "reliability=%.2f, pinned=%s, temporal=%s)",
@@ -670,6 +805,26 @@ class MemoryStore:
 
             # Re-rank with cognitive scores — ALL under the lock
             scored = []
+            # Semantic query vector (best-effort; None => lexical-only fusion)
+            query_vec = None
+            backend = self._get_embedding_backend()
+            if backend is not None and backend.available:
+                query_vec = backend.embed(query)
+
+            # Semantic pass needs ALL non-critical, non-superseded rows (not just
+            # FTS hits) so meaning-based matches can surface memories the lexical
+            # path misses. Build id->row and look up FTS scores for the lexical part.
+            sem_sql = (
+                "SELECT * FROM memories WHERE superseded = 0 AND critical = 0"
+            )
+            sem_params: list = []
+            if target:
+                sem_sql += " AND target = ?"
+                sem_params.append(target)
+            sem_rows = [dict(r) for r in self._conn.execute(sem_sql, sem_params).fetchall()]
+            sem_by_id = {r["id"]: r for r in sem_rows}
+            fts_by_id = {row["id"]: row for row in rows}
+
             # Pre-compute inverse document frequency (IDF) for each query term so
             # that rare, specific terms weigh more than ubiquitous ones (e.g.
             # "pkill" outranks "hermes" which appears in 19/29 memories). This is
@@ -677,14 +832,15 @@ class MemoryStore:
             # from flooding the selective budget.
             query_terms = [t.lower() for t in _strip_operators(query).split() if len(t) > 2 and t.lower() not in _STOPWORDS]
             idf = self._idf_for_terms(query_terms) if query_terms else {}
-            for row in rows:
-                # Criticals live in their own budget tier (see _fetch_critical /
-                # _critical_batch) — exclude from selective scoring to avoid
-                # duplication. They are always injected via the critical section.
-                if row.get("critical"):
-                    continue
-                fts_score = row.pop("fts_score", 0.0)
-                normalized_fts = max(0.0, min(1.0, (-fts_score) / 3.0)) if fts_score != 0 else 0.5
+            alpha = self._embedding_alpha
+            for mid, row in sem_by_id.items():
+                fts_row = fts_by_id.get(mid)
+                if fts_row is not None:
+                    fts_score = fts_row.pop("fts_score", 0.0)
+                    normalized_fts = max(0.0, min(1.0, (-fts_score) / 3.0)) if fts_score != 0 else 0.5
+                else:
+                    # Not a lexical hit — no lexical signal.
+                    normalized_fts = 0.0
 
                 # Compute decayed importance on the fly (not stored)
                 temporal = row.get("temporal", "stable")
@@ -704,19 +860,28 @@ class MemoryStore:
                 # IDF term-match boost: memories matching rarer query terms rank higher
                 idf_boost, matched_term = self._idf_boost_for_row(row, idf)
 
-                # Relevance floor: drop results that neither matched a query term
-                # (matched_term == False) nor have meaningful FTS relevance. This
-                # prevents pure high-importance memories from flooding the
-                # selective budget when the query has no real semantic match
-                # (they still surface via the critical tier if safety-relevant).
-                # NOTE: a matched term with idf≈1.0 (common term in a small
-                # corpus) must NOT be treated as "no match" — matched_term is the
-                # authoritative signal, not the idf value.
-                if not matched_term and normalized_fts < 0.3:
+                # Semantic component (cosine), clamped to [0,1]
+                semantic_score = 0.0
+                if query_vec is not None:
+                    vec = self._get_embedding(mid)
+                    if vec is not None:
+                        semantic_score = max(0.0, _emb_mod.cosine_similarity(query_vec, vec))
+
+                # Fuse lexical + semantic. lexical component is already [0,1].
+                fused = alpha * normalized_fts + (1.0 - alpha) * semantic_score
+
+                # Relevance floor: drop results with NO signal — neither a lexical
+                # term match, nor meaningful FTS relevance, nor semantic similarity
+                # above the semantic floor. The 0.45 floor is tuned so unrelated
+                # short queries (which still score ~0.38-0.40 on nomic-embed-text)
+                # don't pollute the selective pool, while genuine paraphrase
+                # matches (~0.41-0.69) survive.
+                if (not matched_term and normalized_fts < 0.3
+                        and semantic_score < self._semantic_floor):
                     continue
 
                 score = (
-                    normalized_fts
+                    fused
                     * decayed_importance
                     * decayed_confidence
                     * reliability

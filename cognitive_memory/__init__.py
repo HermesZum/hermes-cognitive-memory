@@ -287,6 +287,29 @@ class CognitiveMemoryProvider(MemoryProvider):
 
         self._store = MemoryStore(db_path, self._params)
         self._store.connect()
+
+        # Hybrid (dense + lexical) retrieval config.
+        # Reads memory.cognitive.embeddings.* from config.yaml; defaults to
+        # enabled with Ollama nomic-embed-text on localhost. If Ollama is
+        # down or the model isn't pulled, the backend degrades to NoOp and
+        # retrieval stays lexical-only (no crash).
+        emb_cfg = config.get("embeddings", {}) if isinstance(config, dict) else {}
+        try:
+            self._store.configure_embeddings(
+                enabled=bool(emb_cfg.get("enabled", True)),
+                model=emb_cfg.get("model", "nomic-embed-text"),
+                url=emb_cfg.get("url", "http://localhost:11434/api/embeddings"),
+                alpha=float(emb_cfg.get("alpha", 0.6)),
+                semantic_floor=float(emb_cfg.get("semantic_floor", 0.45)),
+            )
+            # Best-effort one-time backfill of existing memories so semantic
+            # recall works immediately (idempotent; skips rows with vectors).
+            n = self._store.backfill_embeddings()
+            if n:
+                logger.info("cognitive-memory: backfilled %d embeddings", n)
+        except Exception as e:  # noqa: BLE001 - never block init on embeddings
+            logger.warning("cognitive-memory: embedding init failed (%s)", e)
+
         self._initialized = True
         logger.info("cognitive-memory: initialized (db=%s)", db_path)
 
